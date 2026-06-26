@@ -87,14 +87,20 @@ class MyTeamAgent(AutonomousAgent):
             self._agent = BehaviorAgent(hero_actor,
                                         behavior='normal',
                                         opt_dict=self.configs)
-            plan = [(CarlaDataProvider.get_map().get_waypoint(x[0].location),x[1]) for x in self._global_plan_world_coord]
+            plan = []
             prev_wp = None
-            for transform, _ in self._global_plan_world_coord:
-                wp = CarlaDataProvider.get_map() \
-                        .get_waypoint(transform.location)
-                if prev_wp:
-                    plan.extend(self._agent.trace_route(prev_wp, wp))
-                prev_wp = wp
+            for transform, road_option in self._global_plan_world_coord:
+                wp = CarlaDataProvider.get_map().get_waypoint(transform.location)
+                if prev_wp is not None:
+                    segment = self._agent.trace_route(prev_wp, wp)
+                    if segment:
+                        plan.extend(segment)
+                    else:
+                        plan.append((wp, road_option))
+                else:
+                    plan.append((wp, road_option))
+                prev_wp = wp  # stays as-is; trace_route handles filling in between
+
             self._agent.set_global_plan(plan)
             return carla.VehicleControl()
 
