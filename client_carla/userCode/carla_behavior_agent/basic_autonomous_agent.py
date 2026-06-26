@@ -76,7 +76,6 @@ class MyTeamAgent(AutonomousAgent):
 
     def run_step(self, input_data, timestamp):
         if not self._agent:
-            # Find the ego (hero) vehicle
             hero_actor = None
             for actor in CarlaDataProvider.get_world().get_actors():
                 if 'role_name' in actor.attributes and \
@@ -85,12 +84,9 @@ class MyTeamAgent(AutonomousAgent):
             if not hero_actor:
                 return carla.VehicleControl()
 
-            # Initialize the BehaviorAgent
             self._agent = BehaviorAgent(hero_actor,
                                         behavior='normal',
                                         opt_dict=self.configs)
-
-            # Convert the global plan to waypoints and set it
             plan = []
             prev_wp = None
             for transform, _ in self._global_plan_world_coord:
@@ -102,7 +98,23 @@ class MyTeamAgent(AutonomousAgent):
             self._agent.set_global_plan(plan)
             return carla.VehicleControl()
 
-        return self._agent.run_step()
+        else:
+            controls = self._agent.run_step()
+
+            if self.__show:
+                self.showServer.send_frame("RGB", input_data["Center"][1])
+                self.showServer.send_data("Controls", {
+                    "steer": controls.steer,
+                    "throttle": controls.throttle,
+                    "brake": controls.brake,
+                })
+
+            if len(self.configs["SaveSpeedData"]) > 0:
+                with open("team_code/"+self.configs["SaveSpeedData"], "a") as fp:
+                    fp.write(str(timestamp)+";"+str(input_data["Speed"][1]["speed"] * 3.6)+";"+str(self.configs["target_speed"])+"\n")
+                    fp.close()
+
+            return controls
 
     def destroy(self):
         print("DESTROY")
