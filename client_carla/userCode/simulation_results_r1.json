@@ -5,7 +5,7 @@
             "route_id": -1,
             "status": "Failed",
             "infractions": {
-                "collisions_layout": 2.569,
+                "collisions_layout": 6.035,
                 "collisions_pedestrian": 0.0,
                 "collisions_vehicle": 0.0,
                 "red_light": 0.0,
@@ -13,15 +13,15 @@
                 "outside_route_lanes": 0,
                 "min_speed_infractions": 0.0,
                 "yield_emergency_vehicles_infractions": 0.0,
-                "scenario_timeouts": 2.569,
+                "scenario_timeouts": 2.012,
                 "route_dev": 0.0,
                 "vehicle_blocked": 0.0,
-                "route_timeout": 2.569
+                "route_timeout": 0.0
             },
             "scores_mean": {
-                "score_composed": 5.5237,
-                "score_route": 12.14,
-                "score_penalty": 0.455
+                "score_composed": 2.979681,
+                "score_route": 15.5,
+                "score_penalty": 0.192238
             },
             "scores_std_dev": {
                 "score_composed": "NaN",
@@ -33,7 +33,7 @@
                     [
                         "RouteScenario_1_rep0",
                         0,
-                        "Failed - Agent timed out"
+                        "Failed - Agent crashed"
                     ]
                 ]
             }
@@ -46,11 +46,13 @@
             {
                 "index": 0,
                 "route_id": "RouteScenario_1_rep0",
-                "status": "Failed - Agent timed out",
-                "num_infractions": 3,
+                "status": "Failed - Agent crashed",
+                "num_infractions": 4,
                 "infractions": {
                     "collisions_layout": [
-                        "Agent collided against object with type=static.prop.trafficwarning and id=11471 at (x=-1362.096, y=1608.824, z=327.956)"
+                        "Agent collided against object with type=static.prop.trafficwarning and id=34600 at (x=-1361.753, y=1608.826, z=327.96)",
+                        "Agent collided against object with type=static.prop.constructioncone and id=34602 at (x=-1372.631, y=1608.912, z=327.926)",
+                        "Agent collided against object with type=static.prop.constructioncone and id=34607 at (x=-1377.676, y=1608.623, z=327.811)"
                     ],
                     "collisions_pedestrian": [],
                     "collisions_vehicle": [],
@@ -64,19 +66,17 @@
                     ],
                     "route_dev": [],
                     "vehicle_blocked": [],
-                    "route_timeout": [
-                        "Route timeout."
-                    ]
+                    "route_timeout": []
                 },
                 "scores": {
-                    "score_route": 12.14,
-                    "score_penalty": 0.455,
-                    "score_composed": 5.5237
+                    "score_route": 15.5,
+                    "score_penalty": 0.192238,
+                    "score_composed": 2.979681
                 },
                 "meta": {
                     "route_length": 3206.913,
-                    "duration_game": 475.85,
-                    "duration_system": 969.106
+                    "duration_game": 276.6,
+                    "duration_system": 564.314
                 }
             }
         ]
@@ -92,20 +92,20 @@
         "carla_speedometer"
     ],
     "values": [
-        "5.5237",
-        "12.14",
-        "0.455",
+        "2.979681",
+        "15.5",
+        "0.192238",
         "0.0",
         "0.0",
-        "2.569",
+        "6.035",
         "0.0",
         "0.0",
         "0",
         "0.0",
-        "2.569",
         "0.0",
         "0.0",
-        "2.569",
+        "0.0",
+        "2.012",
         "0.0"
     ],
     "labels": [
