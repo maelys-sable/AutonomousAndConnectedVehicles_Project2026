@@ -87,7 +87,7 @@ class MyTeamAgent(AutonomousAgent):
             self._agent = BehaviorAgent(hero_actor,
                                         behavior='normal',
                                         opt_dict=self.configs)
-            plan = []
+            plan = [(CarlaDataProvider.get_map().get_waypoint(x[0].location),x[1]) for x in self._global_plan_world_coord]
             prev_wp = None
             for transform, _ in self._global_plan_world_coord:
                 wp = CarlaDataProvider.get_map() \
