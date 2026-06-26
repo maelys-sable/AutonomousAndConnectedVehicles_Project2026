@@ -140,7 +140,8 @@ class BehaviorAgent(BasicAgent):
             :return distance: distance to nearby vehicle
         """
 
-        vehicle_list = self._world.get_actors().filter("*vehicle*")
+        vehicle_list = list(self._world.get_actors().filter("*vehicle*")) + \
+               list(self._world.get_actors().filter("*static.prop*"))
         def dist(v): return v.get_location().distance(waypoint.transform.location)
         vehicle_list = [v for v in vehicle_list if dist(v) < 45 and v.id != self._vehicle.id]
 

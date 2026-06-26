@@ -50,7 +50,7 @@
                 "num_infractions": 3,
                 "infractions": {
                     "collisions_layout": [
-                        "Agent collided against object with type=static.prop.trafficwarning and id=3697 at (x=-1361.911, y=1608.825, z=327.958)"
+                        "Agent collided against object with type=static.prop.trafficwarning and id=7584 at (x=-1361.767, y=1608.826, z=327.96)"
                     ],
                     "collisions_pedestrian": [],
                     "collisions_vehicle": [],
@@ -76,7 +76,7 @@
                 "meta": {
                     "route_length": 3206.913,
                     "duration_game": 475.85,
-                    "duration_system": 1005.803
+                    "duration_system": 932.733
                 }
             }
         ]
