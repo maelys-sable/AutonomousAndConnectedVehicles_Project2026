@@ -271,21 +271,23 @@ class BehaviorAgent(BasicAgent):
             if distance < self._behavior.braking_distance:
                 return self.emergency_stop()
 
-        # 2.2: Car following behaviors
-        vehicle_state, vehicle, distance = self.collision_and_car_avoid_manager(ego_vehicle_wp)
+            # 2.2: Car following behaviors
+            vehicle_state, vehicle, distance = self.collision_and_car_avoid_manager(ego_vehicle_wp)
 
-        if vehicle_state:
-            # Distance is computed from the center of the two cars,
-            # we use bounding boxes to calculate the actual distance
-            distance = distance - max(
-                vehicle.bounding_box.extent.y, vehicle.bounding_box.extent.x) - max(
-                    self._vehicle.bounding_box.extent.y, self._vehicle.bounding_box.extent.x)
+            if vehicle_state:
+                distance = distance - max(
+                    vehicle.bounding_box.extent.y, vehicle.bounding_box.extent.x) - max(
+                        self._vehicle.bounding_box.extent.y, self._vehicle.bounding_box.extent.x)
 
-            # Emergency brake if the car is very close.
-            if distance < self._behavior.braking_distance:
-                return self.emergency_stop()
-            else:
-                control = self.car_following_manager(vehicle, distance)
+                if distance < self._behavior.braking_distance:
+                    # For static props, attempt a lane bypass before hard stopping
+                    if 'static.prop' in vehicle.type_id:
+                        bypass_control = self._obstacle_avoid_manager(ego_vehicle_wp, vehicle, distance)
+                        if bypass_control is not None:
+                            return bypass_control
+                    return self.emergency_stop()
+                else:
+                    control = self.car_following_manager(vehicle, distance)
 
         # 3: Intersection behavior
         elif self._incoming_waypoint.is_junction and (self._incoming_direction in [RoadOption.LEFT, RoadOption.RIGHT]):
