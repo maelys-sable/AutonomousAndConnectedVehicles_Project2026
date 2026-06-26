@@ -194,8 +194,8 @@ class BasicAgent(object):
         #  Retrieve all relevant actors
         #####
         # Basic Agent :
-        vehicle_list = self._world.get_actors().filter("*vehicle*")
-        ### 
+        vehicle_list = list(self._world.get_actors().filter("*vehicle*")) + \
+               list(self._world.get_actors().filter("*static.prop*"))        ### 
 
         vehicle_speed = get_speed(self._vehicle) / 3.6
 
