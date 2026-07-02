@@ -241,18 +241,12 @@ class BehaviorAgent(BasicAgent):
     def _obstacle_avoid_manager(self, waypoint, vehicle, distance):
         """
         Builds an explicit bypass plan around a static blocking obstacle
-        by stepping waypoints into the adjacent lane and back.
-
-            :param waypoint:  current ego carla.Waypoint
-            :param vehicle:   the blocking actor
-            :param distance:  net distance to the obstacle front face (meters)
-            :return: carla.VehicleControl from the new plan, or None if no bypass found
+        by driving into the opposite lane just long enough to clear it,
+        then merging back into the original lane.
         """
         if self._speed > 5.0:
-            print(f"[AvoidManager] Aborted: speed too high ({self._speed:.1f} > 5.0)")
             return None
         if distance > 20.0:
-            print(f"[AvoidManager] Aborted: distance too far ({distance:.1f} > 20.0)")
             return None
 
         obstacle_len = max(
@@ -261,24 +255,20 @@ class BehaviorAgent(BasicAgent):
         ) * 2.0
 
         step = 2.0
-        d_approach  = max(distance - 2.0, 1.0)
-        d_bypass    = d_approach + obstacle_len + 6.0
-        d_return    = d_bypass   + 6.0
+        d_approach = max(distance - 2.0, 1.0)
+        d_through  = obstacle_len + 8.0
+        return_stabilize = 10.0
 
         all_vehicles = list(self._world.get_actors().filter("*vehicle*"))
 
         for lane_offset, side in [(-1, "left"), (1, "right")]:
             probe_wps = waypoint.next(d_approach + obstacle_len / 2)
             if not probe_wps:
-                print(f"[AvoidManager] {side}: no waypoint ahead (probe)")
+                print(f"[AvoidManager] {side}: no waypoint ahead")
                 continue
             probe_wp = probe_wps[0]
 
-            if lane_offset == -1:
-                bypass_lane_wp = probe_wp.get_left_lane()
-            else:
-                bypass_lane_wp = probe_wp.get_right_lane()
-
+            bypass_lane_wp = probe_wp.get_left_lane() if lane_offset == -1 else probe_wp.get_right_lane()
             if bypass_lane_wp is None:
                 print(f"[AvoidManager] {side}: no adjacent lane exists")
                 continue
@@ -288,45 +278,41 @@ class BehaviorAgent(BasicAgent):
 
             lane_blocked, blocker, blocker_dist = self._vehicle_obstacle_detected(
                 all_vehicles,
-                max_distance=d_return + 10.0,
+                max_distance=d_approach + d_through + 10.0,
                 up_angle_th=180,
                 lane_offset=lane_offset
             )
             if lane_blocked:
                 bname = blocker.type_id if blocker else "?"
-                bdist = blocker_dist if blocker_dist is not None else -1
-                print(f"[AvoidManager] {side}: blocked by {bname} at {bdist:.1f}m")
+                print(f"[AvoidManager] {side}: blocked by {bname}")
                 continue
 
             plan = []
 
-            wps_approach = waypoint.next_until_lane_end(step)
-            current_wp = waypoint
+            # Phase 1: approach in the original lane — track this waypoint in parallel
+            orig_wp = waypoint
             dist_covered = 0.0
             while dist_covered < d_approach:
-                nexts = current_wp.next(step)
+                nexts = orig_wp.next(step)
                 if not nexts:
                     break
-                current_wp = nexts[0]
+                orig_wp = nexts[0]
                 dist_covered += step
-                plan.append((current_wp, RoadOption.LANEFOLLOW))
+                plan.append((orig_wp, RoadOption.LANEFOLLOW))
 
-            if lane_offset == -1:
-                side_wp = current_wp.get_left_lane()
-                lane_road_option = RoadOption.CHANGELANELEFT
-            else:
-                side_wp = current_wp.get_right_lane()
-                lane_road_option = RoadOption.CHANGELANERIGHT
-
+            # Phase 2: lateral move into the opposite lane
+            side_wp = orig_wp.get_left_lane() if lane_offset == -1 else orig_wp.get_right_lane()
+            lane_road_option = RoadOption.CHANGELANELEFT if lane_offset == -1 else RoadOption.CHANGELANERIGHT
             if side_wp is None or side_wp.lane_type != carla.LaneType.Driving:
-                print(f"[AvoidManager] {side}: lateral move failed (side_wp is None or not drivable)")
+                print(f"[AvoidManager] {side}: lateral move failed")
                 continue
-
             plan.append((side_wp, lane_road_option))
 
+            # Phase 3: drive through the opposite lane past the obstacle,
+            # while walking `orig_wp` forward the SAME distance on the original lane in parallel
             current_wp = side_wp
             dist_covered = 0.0
-            while dist_covered < (obstacle_len + 8.0):
+            while dist_covered < d_through:
                 nexts = current_wp.next(step)
                 if not nexts:
                     break
@@ -334,21 +320,21 @@ class BehaviorAgent(BasicAgent):
                 dist_covered += step
                 plan.append((current_wp, RoadOption.LANEFOLLOW))
 
-            if lane_offset == -1:
-                return_wp = current_wp.get_right_lane()
-                return_option = RoadOption.CHANGELANERIGHT
-            else:
-                return_wp = current_wp.get_left_lane()
-                return_option = RoadOption.CHANGELANELEFT
+                orig_nexts = orig_wp.next(step)
+                if orig_nexts:
+                    orig_wp = orig_nexts[0]
 
-            if return_wp is None or return_wp.lane_type != carla.LaneType.Driving:
-                print(f"[AvoidManager] {side}: merge-back failed (return_wp is None or not drivable)")
+            # Phase 4: merge back using the ORIGINAL lane's tracked position —
+            # not derived from the opposite lane, so it's always a valid Driving waypoint
+            if orig_wp is None or orig_wp.lane_type != carla.LaneType.Driving:
+                print(f"[AvoidManager] {side}: merge-back failed (tracked original lane invalid)")
                 continue
+            return_option = RoadOption.CHANGELANERIGHT if lane_offset == -1 else RoadOption.CHANGELANELEFT
+            plan.append((orig_wp, return_option))
 
-            plan.append((return_wp, return_option))
-
-            current_wp = return_wp
-            for _ in range(int(10.0 / step)):
+            # Phase 5: stabilize a few meters in the original lane
+            current_wp = orig_wp
+            for _ in range(int(return_stabilize / step)):
                 nexts = current_wp.next(step)
                 if not nexts:
                     break
@@ -356,7 +342,6 @@ class BehaviorAgent(BasicAgent):
                 plan.append((current_wp, RoadOption.LANEFOLLOW))
 
             if not plan:
-                print(f"[AvoidManager] {side}: plan ended up empty")
                 continue
 
             print(f"[AvoidManager] Bypassing '{vehicle.type_id}' on the {side} "
