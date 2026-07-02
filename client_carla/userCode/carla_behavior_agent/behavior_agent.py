@@ -239,19 +239,14 @@ class BehaviorAgent(BasicAgent):
         return control
 
     def _obstacle_avoid_manager(self, waypoint, vehicle, distance):
-        """
-        Builds an explicit bypass plan around a static blocking obstacle
-        by driving into the opposite lane for a fixed distance, then
-        merging back into the original lane.
-        """
         if self._speed > 5.0:
             return None
         if distance > 20.0:
             return None
 
         step = 2.0
-        d_approach = max(distance - 8.0, 1.0)   # marge suffisante avant de braquer
-        d_through  = 20.0                        # distance fixe dans la voie opposée, couvre toute la zone de chantier
+        d_approach = max(distance - 8.0, 1.0)
+        d_through  = 20.0
         return_stabilize = 10.0
 
         all_vehicles = list(self._world.get_actors().filter("*vehicle*"))
@@ -271,6 +266,11 @@ class BehaviorAgent(BasicAgent):
                 print(f"[AvoidManager] {side}: adjacent lane not drivable (type={bypass_lane_wp.lane_type})")
                 continue
 
+            # Detecte si la voie cible va dans le sens opposé au nôtre
+            opposite_direction = (waypoint.lane_id * bypass_lane_wp.lane_id) < 0
+            print(f"[AvoidManager] {side}: opposite_direction={opposite_direction} "
+                f"(ego lane_id={waypoint.lane_id}, target lane_id={bypass_lane_wp.lane_id})")
+
             lane_blocked, blocker, blocker_dist = self._vehicle_obstacle_detected(
                 all_vehicles,
                 max_distance=d_approach + d_through + 10.0,
@@ -284,7 +284,7 @@ class BehaviorAgent(BasicAgent):
 
             plan = []
 
-            # Phase 1: approche dans la voie d'origine, avec marge avant de braquer
+            # Phase 1: approche dans la voie d'origine (toujours .next(), c'est notre propre sens)
             orig_wp = waypoint
             dist_covered = 0.0
             while dist_covered < d_approach:
@@ -295,7 +295,7 @@ class BehaviorAgent(BasicAgent):
                 dist_covered += step
                 plan.append((orig_wp, RoadOption.LANEFOLLOW))
 
-            # Phase 2: bascule complète dans la voie opposée
+            # Phase 2: bascule dans la voie opposée
             side_wp = orig_wp.get_left_lane() if lane_offset == -1 else orig_wp.get_right_lane()
             lane_road_option = RoadOption.CHANGELANELEFT if lane_offset == -1 else RoadOption.CHANGELANERIGHT
             if side_wp is None or side_wp.lane_type != carla.LaneType.Driving:
@@ -303,11 +303,15 @@ class BehaviorAgent(BasicAgent):
                 continue
             plan.append((side_wp, lane_road_option))
 
-            # Phase 3: on reste sur la voie opposée pendant toute la traversée
+            # Phase 3: on avance physiquement vers l'avant, ce qui veut dire
+            # .previous() si la voie cible est de sens opposé, .next() sinon
             current_wp = side_wp
             dist_covered = 0.0
             while dist_covered < d_through:
-                nexts = current_wp.next(step)
+                if opposite_direction:
+                    nexts = current_wp.previous(step)
+                else:
+                    nexts = current_wp.next(step)
                 if not nexts:
                     break
                 current_wp = nexts[0]
