@@ -5,23 +5,23 @@
             "route_id": -1,
             "status": "Failed",
             "infractions": {
-                "collisions_layout": 6.035,
+                "collisions_layout": 5.137,
                 "collisions_pedestrian": 0.0,
                 "collisions_vehicle": 0.0,
                 "red_light": 0.0,
                 "stop_infraction": 0.0,
-                "outside_route_lanes": 0,
+                "outside_route_lanes": 0.01,
                 "min_speed_infractions": 0.0,
                 "yield_emergency_vehicles_infractions": 0.0,
-                "scenario_timeouts": 2.012,
+                "scenario_timeouts": 0.0,
                 "route_dev": 0.0,
                 "vehicle_blocked": 0.0,
                 "route_timeout": 0.0
             },
             "scores_mean": {
-                "score_composed": 2.979681,
-                "score_route": 15.5,
-                "score_penalty": 0.192238
+                "score_composed": 4.997345,
+                "score_route": 12.14,
+                "score_penalty": 0.411643
             },
             "scores_std_dev": {
                 "score_composed": "NaN",
@@ -33,7 +33,7 @@
                     [
                         "RouteScenario_1_rep0",
                         0,
-                        "Failed - Agent crashed"
+                        "Failed"
                     ]
                 ]
             }
@@ -46,37 +46,36 @@
             {
                 "index": 0,
                 "route_id": "RouteScenario_1_rep0",
-                "status": "Failed - Agent crashed",
-                "num_infractions": 4,
+                "status": "Failed",
+                "num_infractions": 3,
                 "infractions": {
                     "collisions_layout": [
-                        "Agent collided against object with type=static.prop.trafficwarning and id=34600 at (x=-1361.753, y=1608.826, z=327.96)",
-                        "Agent collided against object with type=static.prop.constructioncone and id=34602 at (x=-1372.631, y=1608.912, z=327.926)",
-                        "Agent collided against object with type=static.prop.constructioncone and id=34607 at (x=-1377.676, y=1608.623, z=327.811)"
+                        "Agent collided against object with type=static.prop.constructioncone and id=18846 at (x=-1376.517, y=1608.193, z=327.792)",
+                        "Agent collided against object with type=static.prop.constructioncone and id=18845 at (x=-1381.094, y=1610.255, z=327.927)"
                     ],
                     "collisions_pedestrian": [],
                     "collisions_vehicle": [],
                     "red_light": [],
                     "stop_infraction": [],
-                    "outside_route_lanes": [],
+                    "outside_route_lanes": [
+                        "Agent went outside its route lanes for about 10.001 meters (2.57% of the completed route)"
+                    ],
                     "min_speed_infractions": [],
                     "yield_emergency_vehicles_infractions": [],
-                    "scenario_timeouts": [
-                        "Agent timed out a scenario"
-                    ],
+                    "scenario_timeouts": [],
                     "route_dev": [],
                     "vehicle_blocked": [],
                     "route_timeout": []
                 },
                 "scores": {
-                    "score_route": 15.5,
-                    "score_penalty": 0.192238,
-                    "score_composed": 2.979681
+                    "score_route": 12.14,
+                    "score_penalty": 0.411643,
+                    "score_composed": 4.997345
                 },
                 "meta": {
                     "route_length": 3206.913,
-                    "duration_game": 276.6,
-                    "duration_system": 564.314
+                    "duration_game": 104.9,
+                    "duration_system": 226.389
                 }
             }
         ]
@@ -92,20 +91,20 @@
         "carla_speedometer"
     ],
     "values": [
-        "2.979681",
-        "15.5",
-        "0.192238",
+        "4.997345",
+        "12.14",
+        "0.411643",
         "0.0",
         "0.0",
-        "6.035",
+        "5.137",
         "0.0",
         "0.0",
-        "0",
+        "0.01",
         "0.0",
         "0.0",
         "0.0",
         "0.0",
-        "2.012",
+        "0.0",
         "0.0"
     ],
     "labels": [
