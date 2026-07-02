@@ -239,134 +239,134 @@ class BehaviorAgent(BasicAgent):
         return control
 
     def _obstacle_avoid_manager(self, waypoint, vehicle, distance):
-            """
-            Builds an explicit bypass plan around a static blocking obstacle
-            by stepping waypoints into the adjacent lane and back.
+        """
+        Builds an explicit bypass plan around a static blocking obstacle
+        by stepping waypoints into the adjacent lane and back.
 
-                :param waypoint:  current ego carla.Waypoint
-                :param vehicle:   the blocking actor
-                :param distance:  net distance to the obstacle front face (meters)
-                :return: carla.VehicleControl from the new plan, or None if no bypass found
-            """
-            if self._speed > 5.0:
-                return None
-            if distance > 20.0:
-                return None
-
-            # How long the obstacle footprint is (use bounding box)
-            obstacle_len = max(
-                vehicle.bounding_box.extent.x,
-                vehicle.bounding_box.extent.y
-            ) * 2.0  # full length, not half
-
-            # Distances along the current lane for each phase
-            step = 2.0                               # waypoint resolution (meters)
-            d_approach  = max(distance - 2.0, 1.0)  # stay just behind the obstacle
-            d_bypass    = d_approach + obstacle_len + 6.0   # length of the bypass lane segment
-            d_return    = d_bypass   + 6.0                  # merge back after clearing
-
-            all_vehicles = list(self._world.get_actors().filter("*vehicle*"))
-
-            for lane_offset, side in [(-1, "left"), (1, "right")]:
-                # Sample a waypoint in the candidate bypass lane
-                probe_wps = waypoint.next(d_approach + obstacle_len / 2)
-                if not probe_wps:
-                    continue
-                probe_wp = probe_wps[0]
-
-                if lane_offset == -1:
-                    bypass_lane_wp = probe_wp.get_left_lane()
-                else:
-                    bypass_lane_wp = probe_wp.get_right_lane()
-
-                if bypass_lane_wp is None:
-                    continue
-                if bypass_lane_wp.lane_type != carla.LaneType.Driving:
-                    continue
-
-                # Check bypass lane is clear of moving vehicles
-                lane_blocked, _, _ = self._vehicle_obstacle_detected(
-                    all_vehicles,
-                    max_distance=d_return + 10.0,
-                    up_angle_th=180,
-                    lane_offset=lane_offset
-                )
-                if lane_blocked:
-                    continue
-
-                # --- Build the plan explicitly as a waypoint list ---
-                plan = []
-
-                # Phase 1: approach in current lane up to just before obstacle
-                wps_approach = waypoint.next_until_lane_end(step)
-                current_wp = waypoint
-                dist_covered = 0.0
-                while dist_covered < d_approach:
-                    nexts = current_wp.next(step)
-                    if not nexts:
-                        break
-                    current_wp = nexts[0]
-                    dist_covered += step
-                    plan.append((current_wp, RoadOption.LANEFOLLOW))
-
-                # Phase 2: lateral move into bypass lane
-                if lane_offset == -1:
-                    side_wp = current_wp.get_left_lane()
-                    lane_road_option = RoadOption.CHANGELANELEFT
-                else:
-                    side_wp = current_wp.get_right_lane()
-                    lane_road_option = RoadOption.CHANGELANERIGHT
-
-                if side_wp is None or side_wp.lane_type != carla.LaneType.Driving:
-                    continue
-
-                plan.append((side_wp, lane_road_option))
-
-                # Phase 3: drive through the bypass lane past the obstacle
-                current_wp = side_wp
-                dist_covered = 0.0
-                while dist_covered < (obstacle_len + 8.0):
-                    nexts = current_wp.next(step)
-                    if not nexts:
-                        break
-                    current_wp = nexts[0]
-                    dist_covered += step
-                    plan.append((current_wp, RoadOption.LANEFOLLOW))
-
-                # Phase 4: merge back into original lane
-                if lane_offset == -1:
-                    return_wp = current_wp.get_right_lane()
-                    return_option = RoadOption.CHANGELANERIGHT
-                else:
-                    return_wp = current_wp.get_left_lane()
-                    return_option = RoadOption.CHANGELANELEFT
-
-                if return_wp is None or return_wp.lane_type != carla.LaneType.Driving:
-                    continue
-
-                plan.append((return_wp, return_option))
-
-                # Phase 5: continue a few meters in original lane to stabilize
-                current_wp = return_wp
-                for _ in range(int(10.0 / step)):
-                    nexts = current_wp.next(step)
-                    if not nexts:
-                        break
-                    current_wp = nexts[0]
-                    plan.append((current_wp, RoadOption.LANEFOLLOW))
-
-                if not plan:
-                    continue
-
-                print(f"[AvoidManager] Bypassing '{vehicle.type_id}' on the {side} "
-                    f"| plan={len(plan)} wps | obstacle_len={obstacle_len:.1f}m")
-
-                # Inject the bypass plan — clean_queue=True replaces whatever was queued
-                self._local_planner.set_global_plan(plan, stop_waypoint_creation=True, clean_queue=True)
-                return self._local_planner.run_step()
-
-            print("[AvoidManager] No valid bypass found — emergency stop")
+            :param waypoint:  current ego carla.Waypoint
+            :param vehicle:   the blocking actor
+            :param distance:  net distance to the obstacle front face (meters)
+            :return: carla.VehicleControl from the new plan, or None if no bypass found
+        """
+        if self._speed > 5.0:
+            print(f"[AvoidManager] Aborted: speed too high ({self._speed:.1f} > 5.0)")
             return None
+        if distance > 20.0:
+            print(f"[AvoidManager] Aborted: distance too far ({distance:.1f} > 20.0)")
+            return None
+
+        obstacle_len = max(
+            vehicle.bounding_box.extent.x,
+            vehicle.bounding_box.extent.y
+        ) * 2.0
+
+        step = 2.0
+        d_approach  = max(distance - 2.0, 1.0)
+        d_bypass    = d_approach + obstacle_len + 6.0
+        d_return    = d_bypass   + 6.0
+
+        all_vehicles = list(self._world.get_actors().filter("*vehicle*"))
+
+        for lane_offset, side in [(-1, "left"), (1, "right")]:
+            probe_wps = waypoint.next(d_approach + obstacle_len / 2)
+            if not probe_wps:
+                print(f"[AvoidManager] {side}: no waypoint ahead (probe)")
+                continue
+            probe_wp = probe_wps[0]
+
+            if lane_offset == -1:
+                bypass_lane_wp = probe_wp.get_left_lane()
+            else:
+                bypass_lane_wp = probe_wp.get_right_lane()
+
+            if bypass_lane_wp is None:
+                print(f"[AvoidManager] {side}: no adjacent lane exists")
+                continue
+            if bypass_lane_wp.lane_type != carla.LaneType.Driving:
+                print(f"[AvoidManager] {side}: adjacent lane not drivable (type={bypass_lane_wp.lane_type})")
+                continue
+
+            lane_blocked, blocker, blocker_dist = self._vehicle_obstacle_detected(
+                all_vehicles,
+                max_distance=d_return + 10.0,
+                up_angle_th=180,
+                lane_offset=lane_offset
+            )
+            if lane_blocked:
+                bname = blocker.type_id if blocker else "?"
+                bdist = blocker_dist if blocker_dist is not None else -1
+                print(f"[AvoidManager] {side}: blocked by {bname} at {bdist:.1f}m")
+                continue
+
+            plan = []
+
+            wps_approach = waypoint.next_until_lane_end(step)
+            current_wp = waypoint
+            dist_covered = 0.0
+            while dist_covered < d_approach:
+                nexts = current_wp.next(step)
+                if not nexts:
+                    break
+                current_wp = nexts[0]
+                dist_covered += step
+                plan.append((current_wp, RoadOption.LANEFOLLOW))
+
+            if lane_offset == -1:
+                side_wp = current_wp.get_left_lane()
+                lane_road_option = RoadOption.CHANGELANELEFT
+            else:
+                side_wp = current_wp.get_right_lane()
+                lane_road_option = RoadOption.CHANGELANERIGHT
+
+            if side_wp is None or side_wp.lane_type != carla.LaneType.Driving:
+                print(f"[AvoidManager] {side}: lateral move failed (side_wp is None or not drivable)")
+                continue
+
+            plan.append((side_wp, lane_road_option))
+
+            current_wp = side_wp
+            dist_covered = 0.0
+            while dist_covered < (obstacle_len + 8.0):
+                nexts = current_wp.next(step)
+                if not nexts:
+                    break
+                current_wp = nexts[0]
+                dist_covered += step
+                plan.append((current_wp, RoadOption.LANEFOLLOW))
+
+            if lane_offset == -1:
+                return_wp = current_wp.get_right_lane()
+                return_option = RoadOption.CHANGELANERIGHT
+            else:
+                return_wp = current_wp.get_left_lane()
+                return_option = RoadOption.CHANGELANELEFT
+
+            if return_wp is None or return_wp.lane_type != carla.LaneType.Driving:
+                print(f"[AvoidManager] {side}: merge-back failed (return_wp is None or not drivable)")
+                continue
+
+            plan.append((return_wp, return_option))
+
+            current_wp = return_wp
+            for _ in range(int(10.0 / step)):
+                nexts = current_wp.next(step)
+                if not nexts:
+                    break
+                current_wp = nexts[0]
+                plan.append((current_wp, RoadOption.LANEFOLLOW))
+
+            if not plan:
+                print(f"[AvoidManager] {side}: plan ended up empty")
+                continue
+
+            print(f"[AvoidManager] Bypassing '{vehicle.type_id}' on the {side} "
+                f"| plan={len(plan)} wps | obstacle_len={obstacle_len:.1f}m")
+
+            self._local_planner.set_global_plan(plan, stop_waypoint_creation=True, clean_queue=True)
+            return self._local_planner.run_step()
+
+        print("[AvoidManager] No valid bypass found — emergency stop")
+        return None
 
     def run_step(self, debug=False):
         """
