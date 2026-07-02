@@ -241,28 +241,23 @@ class BehaviorAgent(BasicAgent):
     def _obstacle_avoid_manager(self, waypoint, vehicle, distance):
         """
         Builds an explicit bypass plan around a static blocking obstacle
-        by driving into the opposite lane just long enough to clear it,
-        then merging back into the original lane.
+        by driving into the opposite lane for a fixed distance, then
+        merging back into the original lane.
         """
         if self._speed > 5.0:
             return None
         if distance > 20.0:
             return None
 
-        obstacle_len = max(
-            vehicle.bounding_box.extent.x,
-            vehicle.bounding_box.extent.y
-        ) * 2.0
-
         step = 2.0
-        d_approach = max(distance - 8.0, 1.0)
-        d_through  = obstacle_len + 8.0
+        d_approach = max(distance - 8.0, 1.0)   # marge suffisante avant de braquer
+        d_through  = 20.0                        # distance fixe dans la voie opposée, couvre toute la zone de chantier
         return_stabilize = 10.0
 
         all_vehicles = list(self._world.get_actors().filter("*vehicle*"))
 
         for lane_offset, side in [(-1, "left"), (1, "right")]:
-            probe_wps = waypoint.next(d_approach + obstacle_len / 2)
+            probe_wps = waypoint.next(d_approach + d_through / 2)
             if not probe_wps:
                 print(f"[AvoidManager] {side}: no waypoint ahead")
                 continue
@@ -289,7 +284,7 @@ class BehaviorAgent(BasicAgent):
 
             plan = []
 
-            # Phase 1: approach in the original lane — track this waypoint in parallel
+            # Phase 1: approche dans la voie d'origine, avec marge avant de braquer
             orig_wp = waypoint
             dist_covered = 0.0
             while dist_covered < d_approach:
@@ -300,7 +295,7 @@ class BehaviorAgent(BasicAgent):
                 dist_covered += step
                 plan.append((orig_wp, RoadOption.LANEFOLLOW))
 
-            # Phase 2: lateral move into the opposite lane
+            # Phase 2: bascule complète dans la voie opposée
             side_wp = orig_wp.get_left_lane() if lane_offset == -1 else orig_wp.get_right_lane()
             lane_road_option = RoadOption.CHANGELANELEFT if lane_offset == -1 else RoadOption.CHANGELANERIGHT
             if side_wp is None or side_wp.lane_type != carla.LaneType.Driving:
@@ -308,8 +303,7 @@ class BehaviorAgent(BasicAgent):
                 continue
             plan.append((side_wp, lane_road_option))
 
-            # Phase 3: drive through the opposite lane past the obstacle,
-            # while walking `orig_wp` forward the SAME distance on the original lane in parallel
+            # Phase 3: on reste sur la voie opposée pendant toute la traversée
             current_wp = side_wp
             dist_covered = 0.0
             while dist_covered < d_through:
@@ -324,15 +318,14 @@ class BehaviorAgent(BasicAgent):
                 if orig_nexts:
                     orig_wp = orig_nexts[0]
 
-            # Phase 4: merge back using the ORIGINAL lane's tracked position —
-            # not derived from the opposite lane, so it's always a valid Driving waypoint
+            # Phase 4: retour dans la voie d'origine
             if orig_wp is None or orig_wp.lane_type != carla.LaneType.Driving:
                 print(f"[AvoidManager] {side}: merge-back failed (tracked original lane invalid)")
                 continue
             return_option = RoadOption.CHANGELANERIGHT if lane_offset == -1 else RoadOption.CHANGELANELEFT
             plan.append((orig_wp, return_option))
 
-            # Phase 5: stabilize a few meters in the original lane
+            # Phase 5: stabilisation
             current_wp = orig_wp
             for _ in range(int(return_stabilize / step)):
                 nexts = current_wp.next(step)
@@ -344,8 +337,7 @@ class BehaviorAgent(BasicAgent):
             if not plan:
                 continue
 
-            print(f"[AvoidManager] Bypassing '{vehicle.type_id}' on the {side} "
-                f"| plan={len(plan)} wps | obstacle_len={obstacle_len:.1f}m")
+            print(f"[AvoidManager] Bypassing on the {side} | plan={len(plan)} wps | d_through={d_through:.1f}m")
 
             self._local_planner.set_global_plan(plan, stop_waypoint_creation=True, clean_queue=True)
             return self._local_planner.run_step()
