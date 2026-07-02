@@ -380,7 +380,7 @@ class BehaviorAgent(BasicAgent):
         control = None
         if self._behavior.tailgate_counter > 0:
             self._behavior.tailgate_counter -= 1
-        if self._avoid_counter > 0:               # <- add this
+        if self._avoid_counter > 0:               
             self._avoid_counter -= 1
 
         ego_vehicle_loc = self._vehicle.get_location()
@@ -400,13 +400,13 @@ class BehaviorAgent(BasicAgent):
             if distance < self._behavior.braking_distance:
                 return self.emergency_stop()
 
-            # 2.2: Car following behaviors
-            vehicle_state, vehicle, distance = self.collision_and_car_avoid_manager(ego_vehicle_wp)
+        # 2.2: Car following behaviors
+        vehicle_state, vehicle, distance = self.collision_and_car_avoid_manager(ego_vehicle_wp)
 
-            if vehicle_state:
-                distance = distance - max(
-                    vehicle.bounding_box.extent.y, vehicle.bounding_box.extent.x) - max(
-                        self._vehicle.bounding_box.extent.y, self._vehicle.bounding_box.extent.x)
+        if vehicle_state:
+            distance = distance - max(
+                vehicle.bounding_box.extent.y, vehicle.bounding_box.extent.x) - max(
+                    self._vehicle.bounding_box.extent.y, self._vehicle.bounding_box.extent.x)
 
             if distance < self._behavior.braking_distance:
                 if 'static.prop' in vehicle.type_id and self._avoid_counter == 0:
