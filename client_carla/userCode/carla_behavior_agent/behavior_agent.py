@@ -406,6 +406,7 @@ class BehaviorAgent(BasicAgent):
             self._overtake_state = 'CROSSING'
             self._original_lane_id = ego_wp.lane_id 
             self._original_road_id = ego_wp.road_id
+            self._pre_overtake_plan = list(self._local_planner.get_plan())
             print("[Overtake] Départ du dépassement sur la gauche")
             # continue directement en CROSSING sur ce même tick
 
@@ -484,6 +485,25 @@ class BehaviorAgent(BasicAgent):
                 self._overtake_state = 'IDLE'
                 self._merging_tick_counter = 0
                 self._merge_confirm_ticks = 0
+
+                saved_plan = getattr(self, '_pre_overtake_plan', None)
+                if saved_plan:
+                    ego_loc = self._vehicle.get_location()
+                    closest_idx = min(
+                        range(len(saved_plan)),
+                        key=lambda i: saved_plan[i][0].transform.location.distance(ego_loc)
+                    )
+                    resume_plan = saved_plan[closest_idx + 1:]
+                    if resume_plan:
+                        self._local_planner.set_global_plan(
+                            resume_plan, stop_waypoint_creation=False, clean_queue=True
+                        )
+                    else:
+                        self._local_planner._stop_waypoint_creation = False
+                else:
+                    self._local_planner._stop_waypoint_creation = False
+
+                self._pre_overtake_plan = None
                 print("[Overtake] Retour terminé")
                 return None
             
@@ -573,6 +593,7 @@ class BehaviorAgent(BasicAgent):
             target_speed = min([self._behavior.max_speed, self._speed_limit - 5])
             self._local_planner.set_speed(target_speed)
             control = self._local_planner.run_step(debug=debug)
+            
 
         # 4: Normal behavior
         else:
