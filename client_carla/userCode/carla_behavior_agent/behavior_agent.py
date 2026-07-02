@@ -365,9 +365,12 @@ class BehaviorAgent(BasicAgent):
         control = None
         if self._behavior.tailgate_counter > 0:
             self._behavior.tailgate_counter -= 1
-        if self._avoid_counter > 0:               
+        if self._avoid_counter > 0:
             self._avoid_counter -= 1
-            return self._local_planner.run_step(debug=debug)
+            ctrl = self._local_planner.run_step(debug=debug)
+            print(f"[AvoidDebug] throttle={ctrl.throttle:.2f} steer={ctrl.steer:.2f} "
+                f"brake={ctrl.brake:.2f} speed={self._speed:.1f} avoid_counter={self._avoid_counter}")
+            return ctrl
 
         ego_vehicle_loc = self._vehicle.get_location()
         ego_vehicle_wp = self._map.get_waypoint(ego_vehicle_loc)
