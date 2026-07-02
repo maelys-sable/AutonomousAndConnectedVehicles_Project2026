@@ -411,12 +411,14 @@ class BehaviorAgent(BasicAgent):
             print(f"[DEBUG] vehicle={vehicle.type_id if vehicle else None} distance={distance:.1f} "
           f"braking_distance={self._behavior.braking_distance} avoid_counter={self._avoid_counter}")
 
+            if vehicle is not None and 'static.prop' in vehicle.type_id and self._avoid_counter == 0:
+                bypass_control = self._obstacle_avoid_manager(ego_vehicle_wp, vehicle, distance)
+                if bypass_control is not None:
+                    self._avoid_counter = 150
+                    return bypass_control
+                # falls through to normal handling below if no bypass found
+
             if distance < self._behavior.braking_distance:
-                if 'static.prop' in vehicle.type_id and self._avoid_counter == 0:
-                    bypass_control = self._obstacle_avoid_manager(ego_vehicle_wp, vehicle, distance)
-                    if bypass_control is not None:
-                        self._avoid_counter = 150 
-                        return bypass_control
                 return self.emergency_stop()
             else:
                 control = self.car_following_manager(vehicle, distance)
