@@ -469,6 +469,13 @@ class BehaviorAgent(BasicAgent):
             :return control: carla.VehicleControl
         """
         self._update_information()
+        loc = self._vehicle.get_location()
+        vel = self._vehicle.get_velocity()
+        self._tick_counter_global = getattr(self, '_tick_counter_global', 0) + 1
+        if self._tick_counter_global % 10 == 0:
+            print(f"[Position] tick={self._tick_counter_global} "
+                f"x={loc.x:.2f} y={loc.y:.2f} z={loc.z:.2f} "
+                f"vel=({vel.x:.2f},{vel.y:.2f},{vel.z:.2f}) speed_reported={self._speed:.2f}")
 
         control = None
         if self._behavior.tailgate_counter > 0:
