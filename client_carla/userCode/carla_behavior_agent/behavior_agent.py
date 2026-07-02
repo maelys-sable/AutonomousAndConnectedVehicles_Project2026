@@ -352,10 +352,14 @@ class BehaviorAgent(BasicAgent):
     def _obstacle_still_present(self, road_id, lane_id, max_check_distance=25.0):
         all_props = self._world.get_actors().filter("static.prop.*")
         ego_loc = self._vehicle.get_location()
+        ego_fwd = self._vehicle.get_transform().get_forward_vector()
         for prop in all_props:
             prop_wp = self._map.get_waypoint(prop.get_location(), lane_type=carla.LaneType.Any)
             if prop_wp.road_id == road_id and prop_wp.lane_id == lane_id:
-                if prop.get_location().distance(ego_loc) < max_check_distance:
+                to_prop = prop.get_location() - ego_loc
+                # Si le produit scalaire est négatif, l'obstacle est déjà derrière nous
+                longitudinal = to_prop.x * ego_fwd.x + to_prop.y * ego_fwd.y
+                if longitudinal > 0 and prop.get_location().distance(ego_loc) < max_check_distance:
                     return True
         return False
 
@@ -413,33 +417,36 @@ class BehaviorAgent(BasicAgent):
                     f"({blocker.type_id if blocker else '?'}) — freinage")
                 return self.emergency_stop()
 
-            current_ego_wp = self._map.get_waypoint(self._vehicle.get_location())
-            left_wp = current_ego_wp.get_left_lane()
-            if left_wp is None or left_wp.lane_type != carla.LaneType.Driving:
-                left_wp = current_ego_wp
+            self._crossing_tick_counter = getattr(self, '_crossing_tick_counter', 0) + 1
 
-            # Construit un vrai petit chemin lissé au lieu d'un point unique recalculé
-            # à chaque tick, pour éviter que le contrôleur latéral ne "vise" une cible
-            # instable et produise un grand arc / survirage
-            plan = [(left_wp, RoadOption.CHANGELANELEFT)]
-            step_wp = left_wp
-            for _ in range(3):
-                nexts = step_wp.next(3.0)
-                if not nexts:
-                    break
-                step_wp = nexts[0]
-                plan.append((step_wp, RoadOption.LANEFOLLOW))
+            need_new_plan = (
+                not hasattr(self, '_crossing_plan_ticks')
+                or self._crossing_tick_counter - self._crossing_plan_ticks >= 15
+            )
 
-            self._local_planner.set_global_plan(plan, stop_waypoint_creation=True, clean_queue=True)
+            if need_new_plan:
+                current_ego_wp = self._map.get_waypoint(self._vehicle.get_location())
+                left_wp = current_ego_wp.get_left_lane()
+                if left_wp is None or left_wp.lane_type != carla.LaneType.Driving:
+                    left_wp = current_ego_wp
 
-            # Vitesse bridée pendant la manœuvre latérale, pour ne pas prendre
-            # le virage à pleine accélération comme avant (throttle=0.75 en plein braquage)
-            self._local_planner.set_speed(15)
+                plan = [(left_wp, RoadOption.CHANGELANELEFT)]
+                step_wp = left_wp
+                for _ in range(10):          # horizon ~30 m au lieu de ~9 m
+                    nexts = step_wp.next(3.0)
+                    if not nexts:
+                        break
+                    step_wp = nexts[0]
+                    plan.append((step_wp, RoadOption.LANEFOLLOW))
+
+                self._local_planner.set_global_plan(plan, stop_waypoint_creation=True, clean_queue=True)
+                self._local_planner.set_speed(15)
+                self._crossing_plan_ticks = self._crossing_tick_counter
 
             still_present = self._obstacle_still_present(self._original_road_id, self._original_lane_id)
 
             control = self._local_planner.run_step()
-            self._crossing_tick_counter = getattr(self, '_crossing_tick_counter', 0) + 1
+
             if self._crossing_tick_counter % 20 == 0:
                 print(f"[Overtake][CROSSING] speed={self._speed:.1f} "
                     f"steer={control.steer:.3f} throttle={control.throttle:.2f} "
@@ -448,6 +455,8 @@ class BehaviorAgent(BasicAgent):
             if not still_present:
                 self._overtake_state = 'MERGING_BACK'
                 self._crossing_tick_counter = 0
+                if hasattr(self, '_crossing_plan_ticks'):
+                    del self._crossing_plan_ticks
                 print("[Overtake] Obstacle dépassé — retour sur la voie d'origine")
 
             return control
