@@ -418,13 +418,26 @@ class BehaviorAgent(BasicAgent):
             if left_wp is None or left_wp.lane_type != carla.LaneType.Driving:
                 left_wp = current_ego_wp
 
-            next_wps = left_wp.next(4.0)
-            target = next_wps[0] if next_wps else left_wp
-            self._local_planner.set_global_plan(
-                [(target, RoadOption.CHANGELANELEFT)], stop_waypoint_creation=True, clean_queue=True)
+            # Construit un vrai petit chemin lissé au lieu d'un point unique recalculé
+            # à chaque tick, pour éviter que le contrôleur latéral ne "vise" une cible
+            # instable et produise un grand arc / survirage
+            plan = [(left_wp, RoadOption.CHANGELANELEFT)]
+            step_wp = left_wp
+            for _ in range(3):
+                nexts = step_wp.next(3.0)
+                if not nexts:
+                    break
+                step_wp = nexts[0]
+                plan.append((step_wp, RoadOption.LANEFOLLOW))
+
+            self._local_planner.set_global_plan(plan, stop_waypoint_creation=True, clean_queue=True)
+
+            # Vitesse bridée pendant la manœuvre latérale, pour ne pas prendre
+            # le virage à pleine accélération comme avant (throttle=0.75 en plein braquage)
+            self._local_planner.set_speed(15)
 
             still_present = self._obstacle_still_present(self._original_road_id, self._original_lane_id)
-            
+
             control = self._local_planner.run_step()
             self._crossing_tick_counter = getattr(self, '_crossing_tick_counter', 0) + 1
             if self._crossing_tick_counter % 20 == 0:
