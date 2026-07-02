@@ -464,11 +464,23 @@ class BehaviorAgent(BasicAgent):
         # --- État 3 : on revient sur la voie d'origine ---
         if self._overtake_state == 'MERGING_BACK':
             current_ego_wp = self._map.get_waypoint(self._vehicle.get_location())
+            ego_loc = self._vehicle.get_location()
 
-            if current_ego_wp.road_id == self._original_road_id \
-                    and current_ego_wp.lane_id == self._original_lane_id:
+            on_original_lane = (
+                current_ego_wp.road_id == self._original_road_id
+                and current_ego_wp.lane_id == self._original_lane_id
+                and current_ego_wp.transform.location.distance(ego_loc) < 1.2
+            )
+
+            if on_original_lane:
+                self._merge_confirm_ticks = getattr(self, '_merge_confirm_ticks', 0) + 1
+            else:
+                self._merge_confirm_ticks = 0
+
+            if self._merge_confirm_ticks >= 8:
                 self._overtake_state = 'IDLE'
                 self._merging_tick_counter = 0
+                self._merge_confirm_ticks = 0
                 print("[Overtake] Retour terminé")
                 return None
 
@@ -487,9 +499,9 @@ class BehaviorAgent(BasicAgent):
             self._merging_tick_counter = getattr(self, '_merging_tick_counter', 0) + 1
             if self._merging_tick_counter % 10 == 0:
                 print(f"[Overtake][MERGING_BACK] road_id={current_ego_wp.road_id} "
-                      f"lane_id={current_ego_wp.lane_id} "
-                      f"target_road={self._original_road_id} target_lane={self._original_lane_id} "
-                      f"speed={self._speed:.1f}")
+                      f"lane_id={current_ego_wp.lane_id} dist_to_lane_center="
+                      f"{current_ego_wp.transform.location.distance(ego_loc):.2f} "
+                      f"confirm_ticks={self._merge_confirm_ticks} speed={self._speed:.1f}")
 
             return self._local_planner.run_step()
 
