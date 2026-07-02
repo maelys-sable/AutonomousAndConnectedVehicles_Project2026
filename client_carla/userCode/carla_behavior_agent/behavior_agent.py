@@ -386,7 +386,7 @@ class BehaviorAgent(BasicAgent):
         if self._overtake_state == 'IDLE':
             if vehicle is None or 'static.prop' not in vehicle.type_id:
                 return None
-            if self._speed > 5.0 or distance > 20.0:
+            if self._speed > 8.0 or distance > 30.0:
                 return None
 
             clear, blocker = self._oncoming_lane_clear(lane_offset=-1)
