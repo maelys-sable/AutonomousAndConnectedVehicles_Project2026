@@ -51,7 +51,7 @@ class BehaviorAgent(BasicAgent):
         self._behavior = None
         self._sampling_resolution = 4.5
         self._overtake_state = 'IDLE'
-        
+
         # Parameters for agent behavior
         if behavior == 'cautious':
             self._behavior = Cautious()
@@ -349,17 +349,13 @@ class BehaviorAgent(BasicAgent):
     #     print("[AvoidManager] No valid bypass found — emergency stop")
          return None
 
-    def _obstacle_still_present(self, ego_wp, max_check_distance=25.0):
-        """
-        Vérifie si un obstacle statique (cône, panneau...) est toujours présent
-        sur la voie d'origine, devant nous.
-        """
+    def _obstacle_still_present(self, road_id, lane_id, max_check_distance=25.0):
         all_props = self._world.get_actors().filter("static.prop.*")
+        ego_loc = self._vehicle.get_location()
         for prop in all_props:
             prop_wp = self._map.get_waypoint(prop.get_location(), lane_type=carla.LaneType.Any)
-            if prop_wp.road_id == ego_wp.road_id and prop_wp.lane_id == ego_wp.lane_id:
-                dist = prop.get_location().distance(ego_wp.transform.location)
-                if dist < max_check_distance:
+            if prop_wp.road_id == road_id and prop_wp.lane_id == lane_id:
+                if prop.get_location().distance(ego_loc) < max_check_distance:
                     return True
         return False
 
@@ -374,7 +370,6 @@ class BehaviorAgent(BasicAgent):
             all_vehicles, max_distance=max_distance, up_angle_th=180, lane_offset=lane_offset
         )
         return not lane_blocked, blocker
-
 
     def overtake_manager(self, ego_wp, vehicle=None, distance=None):
         """
@@ -405,6 +400,8 @@ class BehaviorAgent(BasicAgent):
                 return None
 
             self._overtake_state = 'CROSSING'
+            self._original_lane_id = ego_wp.lane_id 
+            self._original_road_id = ego_wp.road_id
             print("[Overtake] Départ du dépassement sur la gauche")
             # continue directement en CROSSING sur ce même tick
 
@@ -426,8 +423,18 @@ class BehaviorAgent(BasicAgent):
             self._local_planner.set_global_plan(
                 [(target, RoadOption.CHANGELANELEFT)], stop_waypoint_creation=True, clean_queue=True)
 
-            if not self._obstacle_still_present(current_ego_wp):
+            still_present = self._obstacle_still_present(self._original_road_id, self._original_lane_id)
+            
+            self._crossing_tick_counter = getattr(self, '_crossing_tick_counter', 0) + 1
+            if self._crossing_tick_counter % 20 == 0:
+                print(f"[Overtake][CROSSING] speed={self._speed:.1f} "
+                    f"ego_lane_id={current_ego_wp.lane_id} "
+                    f"still_present={still_present} "
+                    f"tick={self._crossing_tick_counter}")
+
+            if not still_present:
                 self._overtake_state = 'MERGING_BACK'
+                self._crossing_tick_counter = 0
                 print("[Overtake] Obstacle dépassé — retour sur la voie d'origine")
 
             return self._local_planner.run_step()
