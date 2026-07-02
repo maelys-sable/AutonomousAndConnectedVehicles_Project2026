@@ -255,7 +255,7 @@ class BehaviorAgent(BasicAgent):
         ) * 2.0
 
         step = 2.0
-        d_approach = max(distance - 2.0, 1.0)
+        d_approach = max(distance - 8.0, 1.0)
         d_through  = obstacle_len + 8.0
         return_stabilize = 10.0
 
@@ -367,6 +367,7 @@ class BehaviorAgent(BasicAgent):
             self._behavior.tailgate_counter -= 1
         if self._avoid_counter > 0:               
             self._avoid_counter -= 1
+            return self._local_planner.run_step(debug=debug)
 
         ego_vehicle_loc = self._vehicle.get_location()
         ego_vehicle_wp = self._map.get_waypoint(ego_vehicle_loc)
