@@ -407,6 +407,9 @@ class BehaviorAgent(BasicAgent):
             distance = distance - max(
                 vehicle.bounding_box.extent.y, vehicle.bounding_box.extent.x) - max(
                     self._vehicle.bounding_box.extent.y, self._vehicle.bounding_box.extent.x)
+            
+            print(f"[DEBUG] vehicle={vehicle.type_id if vehicle else None} distance={distance:.1f} "
+          f"braking_distance={self._behavior.braking_distance} avoid_counter={self._avoid_counter}")
 
             if distance < self._behavior.braking_distance:
                 if 'static.prop' in vehicle.type_id and self._avoid_counter == 0:
