@@ -425,19 +425,19 @@ class BehaviorAgent(BasicAgent):
 
             still_present = self._obstacle_still_present(self._original_road_id, self._original_lane_id)
             
+            control = self._local_planner.run_step()
             self._crossing_tick_counter = getattr(self, '_crossing_tick_counter', 0) + 1
             if self._crossing_tick_counter % 20 == 0:
                 print(f"[Overtake][CROSSING] speed={self._speed:.1f} "
-                    f"ego_lane_id={current_ego_wp.lane_id} "
-                    f"still_present={still_present} "
-                    f"tick={self._crossing_tick_counter}")
+                    f"steer={control.steer:.3f} throttle={control.throttle:.2f} "
+                    f"still_present={still_present}")
 
             if not still_present:
                 self._overtake_state = 'MERGING_BACK'
                 self._crossing_tick_counter = 0
                 print("[Overtake] Obstacle dépassé — retour sur la voie d'origine")
 
-            return self._local_planner.run_step()
+            return control
 
         # --- État 3 : on revient sur la voie d'origine ---
         if self._overtake_state == 'MERGING_BACK':
