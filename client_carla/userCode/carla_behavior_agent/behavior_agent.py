@@ -466,13 +466,16 @@ class BehaviorAgent(BasicAgent):
             current_ego_wp = self._map.get_waypoint(self._vehicle.get_location())
             ego_loc = self._vehicle.get_location()
 
-            on_original_lane = (
-                current_ego_wp.road_id == self._original_road_id
-                and current_ego_wp.lane_id == self._original_lane_id
-                and current_ego_wp.transform.location.distance(ego_loc) < 1.2
+            target_wp = self._map.get_waypoint_xodr(
+                self._original_road_id, self._original_lane_id, current_ego_wp.s
             )
 
-            if on_original_lane:
+            if target_wp is None:
+                target_wp = current_ego_wp
+
+            dist_to_target = target_wp.transform.location.distance(ego_loc)
+
+            if dist_to_target < 1.2:
                 self._merge_confirm_ticks = getattr(self, '_merge_confirm_ticks', 0) + 1
             else:
                 self._merge_confirm_ticks = 0
@@ -483,24 +486,23 @@ class BehaviorAgent(BasicAgent):
                 self._merge_confirm_ticks = 0
                 print("[Overtake] Retour terminé")
                 return None
+            
+            plan = [(target_wp, RoadOption.CHANGELANERIGHT)]
+            step_wp = target_wp
+            for _ in range(6):
+                nexts = step_wp.next(3.0)
+                if not nexts:
+                    break
+                step_wp = nexts[0]
+                plan.append((step_wp, RoadOption.LANEFOLLOW))
 
-            right_wp = current_ego_wp.get_right_lane()
-            if right_wp is None or right_wp.lane_type != carla.LaneType.Driving:
-                right_wp = current_ego_wp
-
-            next_wps = right_wp.next(4.0)
-            target = next_wps[0] if next_wps else right_wp
-            self._local_planner.set_global_plan(
-                [(right_wp, RoadOption.CHANGELANERIGHT), (target, RoadOption.LANEFOLLOW)],
-                stop_waypoint_creation=True, clean_queue=True)
-
+            self._local_planner.set_global_plan(plan, stop_waypoint_creation=True, clean_queue=True)
             self._local_planner.set_speed(15)
 
             self._merging_tick_counter = getattr(self, '_merging_tick_counter', 0) + 1
             if self._merging_tick_counter % 10 == 0:
-                print(f"[Overtake][MERGING_BACK] road_id={current_ego_wp.road_id} "
-                      f"lane_id={current_ego_wp.lane_id} dist_to_lane_center="
-                      f"{current_ego_wp.transform.location.distance(ego_loc):.2f} "
+                print(f"[Overtake][MERGING_BACK] target_road={self._original_road_id} "
+                      f"target_lane={self._original_lane_id} dist_to_target={dist_to_target:.2f} "
                       f"confirm_ticks={self._merge_confirm_ticks} speed={self._speed:.1f}")
 
             return self._local_planner.run_step()
