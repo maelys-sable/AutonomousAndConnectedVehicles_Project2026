@@ -188,7 +188,7 @@ class BehaviorAgent(BasicAgent):
         """
 
         walker_list = self._world.get_actors().filter("*walker.pedestrian*")
-        bike_list = [v for v in self._world.get_actors().filter("*vehicle*") if self._is_two_wheeler(v)]
+        bike_list = [v for v in self._world.get_actors().filter("*vehicle*") ]#if self._is_two_wheeler(v)]
         hazard_list = walker_list + bike_list
 
         def dist(w): return w.get_location().distance(waypoint.transform.location)
