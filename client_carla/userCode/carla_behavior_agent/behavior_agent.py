@@ -182,34 +182,38 @@ class BehaviorAgent(BasicAgent):
         return actor.type_id.startswith(_TWO_WHEELER_PREFIXES)
 
     def pedestrian_avoid_manager(self, waypoint):
-        """
-        This module is in charge of warning in case of a collision
-        with any pedestrian.
-        ...
-        """
         walker_list = list(self._world.get_actors().filter("*walker.pedestrian*"))
         bike_list = [v for v in self._world.get_actors().filter("*vehicle*") if self._is_two_wheeler(v)]
         hazard_list = walker_list + bike_list
-        if bike_list :
-            print(f"[BikeDetect] {len(bike_list)} vélo(s) suivi(s) dans la scène: "
-              f"{[b.type_id for b in bike_list]}")
+
+        # Log seulement si le nombre de vélos suivis change
+        if len(bike_list) != getattr(self, '_last_bike_count', -1):
+            print(f"[BikeDetect] {len(bike_list)} vélo(s) suivi(s): {[b.type_id for b in bike_list]}")
+            self._last_bike_count = len(bike_list)
 
         def dist(w): return w.get_location().distance(waypoint.transform.location)
         hazard_list = [w for w in hazard_list if dist(w) < 20]
+
         if self._direction == RoadOption.CHANGELANELEFT:
-            walker_state, walker, distance = self._vehicle_obstacle_detected(hazard_list, max(
+            state, obj, distance = self._vehicle_obstacle_detected(hazard_list, max(
                 self._behavior.min_proximity_threshold, self._speed_limit / 2), up_angle_th=90, lane_offset=-1)
         elif self._direction == RoadOption.CHANGELANERIGHT:
-            walker_state, walker, distance = self._vehicle_obstacle_detected(hazard_list, max(
+            state, obj, distance = self._vehicle_obstacle_detected(hazard_list, max(
                 self._behavior.min_proximity_threshold, self._speed_limit / 2), up_angle_th=90, lane_offset=1)
         else:
-            walker_state, walker, distance = self._vehicle_obstacle_detected(hazard_list, max(
+            state, obj, distance = self._vehicle_obstacle_detected(hazard_list, max(
                 self._behavior.min_proximity_threshold, self._speed_limit / 3), up_angle_th=90)
-        
-        if walker_state:
-            print(f"[BikeDetect] DANGER détecté: {walker.type_id} à {distance:.1f}m")
-        
-        return walker_state, walker, distance
+
+        # Log seulement quand le danger apparaît/disparaît, pas à chaque tick
+        was_danger = getattr(self, '_last_danger_state', False)
+        if state != was_danger:
+            if state:
+                print(f"[BikeDetect] DANGER détecté: {obj.type_id} à {distance:.1f}m")
+            else:
+                print(f"[BikeDetect] Danger écarté")
+            self._last_danger_state = state
+
+        return state, obj, distance
 
     def car_following_manager(self, vehicle, distance, debug=False):
         """
@@ -394,10 +398,23 @@ class BehaviorAgent(BasicAgent):
                 saved_plan = getattr(self, '_pre_overtake_plan', None)
                 if saved_plan:
                     ego_loc = self._vehicle.get_location()
-                    closest_idx = min(
-                        range(len(saved_plan)),
-                        key=lambda i: saved_plan[i][0].transform.location.distance(ego_loc)
-                    )
+                    ego_forward = self._vehicle.get_transform().get_forward_vector()
+
+                    def is_ahead(wp_tuple):
+                        to_wp = wp_tuple[0].transform.location - ego_loc
+                        return (to_wp.x * ego_forward.x + to_wp.y * ego_forward.y) > 0
+
+                    ahead_candidates = [(i, wp) for i, wp in enumerate(saved_plan) if is_ahead(wp)]
+
+                    if ahead_candidates:
+                        closest_idx = min(
+                            ahead_candidates,
+                            key=lambda pair: pair[1][0].transform.location.distance(ego_loc)
+                        )[0]
+                    else:
+                        # Tout le plan sauvegardé est derrière nous : on saute directement à la fin
+                        closest_idx = len(saved_plan) - 1
+
                     resume_plan = saved_plan[closest_idx + 1:]
                     if resume_plan:
                         self._local_planner.set_global_plan(
