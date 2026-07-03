@@ -17,6 +17,17 @@ from behavior_types import Cautious, Aggressive, Normal
 
 from misc import get_speed, positive, is_within_distance, compute_distance
 
+
+_TWO_WHEELER_PREFIXES = (
+    'vehicle.bh.crossbike',
+    'vehicle.diamondback.century',
+    'vehicle.gazelle.omafiets',
+    'vehicle.harley-davidson.low_rider',
+    'vehicle.kawasaki.ninja',
+    'vehicle.yamaha.yzf',
+    'vehicle.vespa.zx125',
+)
+
 class BehaviorAgent(BasicAgent):
     """
     BehaviorAgent implements an agent that navigates scenes to reach a given
@@ -168,32 +179,25 @@ class BehaviorAgent(BasicAgent):
         return vehicle_state, vehicle, distance
 
     def _is_two_wheeler(self, actor):
-        if not actor.type_id.startswith('vehicle.'):
-            return False
-        try:
-            return len(actor.get_physics_control().wheels) == 2
-        except RuntimeError:
-            return False
+        return actor.type_id.startswith(_TWO_WHEELER_PREFIXES)
+
+    class BehaviorAgent(BasicAgent):
+    ...
+
+    def _is_two_wheeler(self, actor):
+        return actor.type_id.startswith(_TWO_WHEELER_PREFIXES)
 
     def pedestrian_avoid_manager(self, waypoint):
         """
         This module is in charge of warning in case of a collision
         with any pedestrian.
-
-            :param location: current location of the agent
-            :param waypoint: current waypoint of the agent
-            :return vehicle_state: True if there is a walker nearby, False if not
-            :return vehicle: nearby walker
-            :return distance: distance to nearby walker
+        ...
         """
-
         walker_list = list(self._world.get_actors().filter("*walker.pedestrian*"))
         bike_list = [v for v in self._world.get_actors().filter("*vehicle*") if self._is_two_wheeler(v)]
         hazard_list = walker_list + bike_list
-
         def dist(w): return w.get_location().distance(waypoint.transform.location)
         hazard_list = [w for w in hazard_list if dist(w) < 20]
-
         if self._direction == RoadOption.CHANGELANELEFT:
             walker_state, walker, distance = self._vehicle_obstacle_detected(hazard_list, max(
                 self._behavior.min_proximity_threshold, self._speed_limit / 2), up_angle_th=90, lane_offset=-1)
@@ -203,7 +207,6 @@ class BehaviorAgent(BasicAgent):
         else:
             walker_state, walker, distance = self._vehicle_obstacle_detected(hazard_list, max(
                 self._behavior.min_proximity_threshold, self._speed_limit / 3), up_angle_th=90)
-
         return walker_state, walker, distance
 
     def car_following_manager(self, vehicle, distance, debug=False):
