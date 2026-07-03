@@ -258,7 +258,7 @@ class BehaviorAgent(BasicAgent):
 
         return control
 
-    def _obstacle_still_present(self, road_id, lane_id, max_check_distance=25.0):
+    def _obstacle_still_present(self, road_id, lane_id, max_check_distance=None):
         all_props = self._world.get_actors().filter("static.prop.*")
         ego_loc = self._vehicle.get_location()
         ego_fwd = self._vehicle.get_transform().get_forward_vector()
@@ -266,10 +266,10 @@ class BehaviorAgent(BasicAgent):
             prop_wp = self._map.get_waypoint(prop.get_location(), lane_type=carla.LaneType.Any)
             if prop_wp.road_id == road_id and prop_wp.lane_id == lane_id:
                 to_prop = prop.get_location() - ego_loc
-                # Si le produit scalaire est négatif, l'obstacle est déjà derrière nous
                 longitudinal = to_prop.x * ego_fwd.x + to_prop.y * ego_fwd.y
-                if longitudinal > 0 and prop.get_location().distance(ego_loc) < max_check_distance:
-                    return True
+                if longitudinal > 0:
+                    if max_check_distance is None or prop.get_location().distance(ego_loc) < max_check_distance:
+                        return True
         return False
 
     def _oncoming_lane_clear(self, lane_offset=-1, max_distance=40.0):
