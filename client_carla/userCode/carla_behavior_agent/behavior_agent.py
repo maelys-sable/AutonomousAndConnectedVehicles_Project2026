@@ -167,7 +167,7 @@ class BehaviorAgent(BasicAgent):
 
         return vehicle_state, vehicle, distance
 
-    def _is_two_wheeler(actor):
+    def _is_two_wheeler(self, actor):
         if not actor.type_id.startswith('vehicle.'):
             return False
         try:
