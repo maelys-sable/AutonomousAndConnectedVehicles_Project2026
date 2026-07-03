@@ -190,6 +190,10 @@ class BehaviorAgent(BasicAgent):
         walker_list = list(self._world.get_actors().filter("*walker.pedestrian*"))
         bike_list = [v for v in self._world.get_actors().filter("*vehicle*") if self._is_two_wheeler(v)]
         hazard_list = walker_list + bike_list
+        if bike_list :
+            print(f"[BikeDetect] {len(bike_list)} vélo(s) suivi(s) dans la scène: "
+              f"{[b.type_id for b in bike_list]}")
+
         def dist(w): return w.get_location().distance(waypoint.transform.location)
         hazard_list = [w for w in hazard_list if dist(w) < 20]
         if self._direction == RoadOption.CHANGELANELEFT:
@@ -201,6 +205,10 @@ class BehaviorAgent(BasicAgent):
         else:
             walker_state, walker, distance = self._vehicle_obstacle_detected(hazard_list, max(
                 self._behavior.min_proximity_threshold, self._speed_limit / 3), up_angle_th=90)
+        
+        if walker_state:
+            print(f"[BikeDetect] DANGER détecté: {walker.type_id} à {distance:.1f}m")
+        
         return walker_state, walker, distance
 
     def car_following_manager(self, vehicle, distance, debug=False):
