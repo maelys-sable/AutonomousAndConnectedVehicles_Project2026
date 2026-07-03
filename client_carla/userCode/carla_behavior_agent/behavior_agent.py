@@ -167,6 +167,14 @@ class BehaviorAgent(BasicAgent):
 
         return vehicle_state, vehicle, distance
 
+    def _is_two_wheeler(actor):
+        if not actor.type_id.startswith('vehicle.'):
+            return False
+        try:
+            return len(actor.get_physics_control().wheels) == 2
+        except RuntimeError:
+            return False
+
     def pedestrian_avoid_manager(self, waypoint):
         """
         This module is in charge of warning in case of a collision
@@ -180,18 +188,21 @@ class BehaviorAgent(BasicAgent):
         """
 
         walker_list = self._world.get_actors().filter("*walker.pedestrian*")
+        bike_list = [v for v in self._world.get_actors().filter("*vehicle*") if _is_two_wheeler(v)]
+        hazard_list = walker_list + bike_list
+
         def dist(w): return w.get_location().distance(waypoint.transform.location)
-        walker_list = [w for w in walker_list if dist(w) < 10]
+        hazard_list = [w for w in hazard_list if dist(w) < 20]
 
         if self._direction == RoadOption.CHANGELANELEFT:
-            walker_state, walker, distance = self._vehicle_obstacle_detected(walker_list, max(
+            walker_state, walker, distance = self._vehicle_obstacle_detected(hazard_list, max(
                 self._behavior.min_proximity_threshold, self._speed_limit / 2), up_angle_th=90, lane_offset=-1)
         elif self._direction == RoadOption.CHANGELANERIGHT:
-            walker_state, walker, distance = self._vehicle_obstacle_detected(walker_list, max(
+            walker_state, walker, distance = self._vehicle_obstacle_detected(hazard_list, max(
                 self._behavior.min_proximity_threshold, self._speed_limit / 2), up_angle_th=90, lane_offset=1)
         else:
-            walker_state, walker, distance = self._vehicle_obstacle_detected(walker_list, max(
-                self._behavior.min_proximity_threshold, self._speed_limit / 3), up_angle_th=60)
+            walker_state, walker, distance = self._vehicle_obstacle_detected(hazard_list, max(
+                self._behavior.min_proximity_threshold, self._speed_limit / 3), up_angle_th=90)
 
         return walker_state, walker, distance
 
@@ -237,117 +248,6 @@ class BehaviorAgent(BasicAgent):
             control = self._local_planner.run_step(debug=debug)
 
         return control
-
-    def _obstacle_avoid_manager(self, waypoint, vehicle, distance):
-    #     if self._speed > 5.0:
-    #         return None
-    #     if distance > 20.0:
-    #         return None
-
-    #     step = 2.0
-    #     d_approach = max(distance - 8.0, 1.0)
-    #     d_through  = 20.0
-    #     return_stabilize = 10.0
-
-    #     all_vehicles = list(self._world.get_actors().filter("*vehicle*"))
-
-    #     for lane_offset, side in [(-1, "left"), (1, "right")]:
-    #         probe_wps = waypoint.next(d_approach + d_through / 2)
-    #         if not probe_wps:
-    #             print(f"[AvoidManager] {side}: no waypoint ahead")
-    #             continue
-    #         probe_wp = probe_wps[0]
-
-    #         bypass_lane_wp = probe_wp.get_left_lane() if lane_offset == -1 else probe_wp.get_right_lane()
-    #         if bypass_lane_wp is None:
-    #             print(f"[AvoidManager] {side}: no adjacent lane exists")
-    #             continue
-    #         if bypass_lane_wp.lane_type != carla.LaneType.Driving:
-    #             print(f"[AvoidManager] {side}: adjacent lane not drivable (type={bypass_lane_wp.lane_type})")
-    #             continue
-
-    #         # Detecte si la voie cible va dans le sens opposé au nôtre
-    #         opposite_direction = (waypoint.lane_id * bypass_lane_wp.lane_id) < 0
-    #         print(f"[AvoidManager] {side}: opposite_direction={opposite_direction} "
-    #             f"(ego lane_id={waypoint.lane_id}, target lane_id={bypass_lane_wp.lane_id})")
-
-    #         lane_blocked, blocker, blocker_dist = self._vehicle_obstacle_detected(
-    #             all_vehicles,
-    #             max_distance=d_approach + d_through + 10.0,
-    #             up_angle_th=180,
-    #             lane_offset=lane_offset
-    #         )
-    #         if lane_blocked:
-    #             bname = blocker.type_id if blocker else "?"
-    #             print(f"[AvoidManager] {side}: blocked by {bname}")
-    #             continue
-
-    #         plan = []
-
-    #         # Phase 1: approche dans la voie d'origine (toujours .next(), c'est notre propre sens)
-    #         orig_wp = waypoint
-    #         dist_covered = 0.0
-    #         while dist_covered < d_approach:
-    #             nexts = orig_wp.next(step)
-    #             if not nexts:
-    #                 break
-    #             orig_wp = nexts[0]
-    #             dist_covered += step
-    #             plan.append((orig_wp, RoadOption.LANEFOLLOW))
-
-    #         # Phase 2: bascule dans la voie opposée
-    #         side_wp = orig_wp.get_left_lane() if lane_offset == -1 else orig_wp.get_right_lane()
-    #         lane_road_option = RoadOption.CHANGELANELEFT if lane_offset == -1 else RoadOption.CHANGELANERIGHT
-    #         if side_wp is None or side_wp.lane_type != carla.LaneType.Driving:
-    #             print(f"[AvoidManager] {side}: lateral move failed")
-    #             continue
-    #         plan.append((side_wp, lane_road_option))
-
-    #         # Phase 3: on avance physiquement vers l'avant, ce qui veut dire
-    #         # .previous() si la voie cible est de sens opposé, .next() sinon
-    #         current_wp = side_wp
-    #         dist_covered = 0.0
-    #         while dist_covered < d_through:
-    #             if opposite_direction:
-    #                 nexts = current_wp.previous(step)
-    #             else:
-    #                 nexts = current_wp.next(step)
-    #             if not nexts:
-    #                 break
-    #             current_wp = nexts[0]
-    #             dist_covered += step
-    #             plan.append((current_wp, RoadOption.LANEFOLLOW))
-
-    #             orig_nexts = orig_wp.next(step)
-    #             if orig_nexts:
-    #                 orig_wp = orig_nexts[0]
-
-    #         # Phase 4: retour dans la voie d'origine
-    #         if orig_wp is None or orig_wp.lane_type != carla.LaneType.Driving:
-    #             print(f"[AvoidManager] {side}: merge-back failed (tracked original lane invalid)")
-    #             continue
-    #         return_option = RoadOption.CHANGELANERIGHT if lane_offset == -1 else RoadOption.CHANGELANELEFT
-    #         plan.append((orig_wp, return_option))
-
-    #         # Phase 5: stabilisation
-    #         current_wp = orig_wp
-    #         for _ in range(int(return_stabilize / step)):
-    #             nexts = current_wp.next(step)
-    #             if not nexts:
-    #                 break
-    #             current_wp = nexts[0]
-    #             plan.append((current_wp, RoadOption.LANEFOLLOW))
-
-    #         if not plan:
-    #             continue
-
-    #         print(f"[AvoidManager] Bypassing on the {side} | plan={len(plan)} wps | d_through={d_through:.1f}m")
-
-    #         self._local_planner.set_global_plan(plan, stop_waypoint_creation=True, clean_queue=True)
-    #         return self._local_planner.run_step()
-
-    #     print("[AvoidManager] No valid bypass found — emergency stop")
-         return None
 
     def _obstacle_still_present(self, road_id, lane_id, max_check_distance=25.0):
         all_props = self._world.get_actors().filter("static.prop.*")
