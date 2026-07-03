@@ -167,13 +167,13 @@ class BehaviorAgent(BasicAgent):
 
         return vehicle_state, vehicle, distance
 
-    def _is_two_wheeler(self, actor):
-        if not actor.type_id.startswith('vehicle.'):
-            return False
-        try:
-            return len(actor.get_physics_control().wheels) == 2
-        except RuntimeError:
-            return False
+    # def _is_two_wheeler(self, actor):
+    #     if not actor.type_id.startswith('vehicle.'):
+    #         return False
+    #     try:
+    #         return len(actor.get_physics_control().wheels) == 2
+    #     except RuntimeError:
+    #         return False
 
     def pedestrian_avoid_manager(self, waypoint):
         """
