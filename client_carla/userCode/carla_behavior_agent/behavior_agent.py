@@ -181,12 +181,6 @@ class BehaviorAgent(BasicAgent):
     def _is_two_wheeler(self, actor):
         return actor.type_id.startswith(_TWO_WHEELER_PREFIXES)
 
-    class BehaviorAgent(BasicAgent):
-    ...
-
-    def _is_two_wheeler(self, actor):
-        return actor.type_id.startswith(_TWO_WHEELER_PREFIXES)
-
     def pedestrian_avoid_manager(self, waypoint):
         """
         This module is in charge of warning in case of a collision
