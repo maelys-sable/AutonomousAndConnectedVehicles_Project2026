@@ -167,13 +167,13 @@ class BehaviorAgent(BasicAgent):
 
         return vehicle_state, vehicle, distance
 
-    # def _is_two_wheeler(self, actor):
-    #     if not actor.type_id.startswith('vehicle.'):
-    #         return False
-    #     try:
-    #         return len(actor.get_physics_control().wheels) == 2
-    #     except RuntimeError:
-    #         return False
+    def _is_two_wheeler(self, actor):
+        if not actor.type_id.startswith('vehicle.'):
+            return False
+        try:
+            return len(actor.get_physics_control().wheels) == 2
+        except RuntimeError:
+            return False
 
     def pedestrian_avoid_manager(self, waypoint):
         """
@@ -187,8 +187,8 @@ class BehaviorAgent(BasicAgent):
             :return distance: distance to nearby walker
         """
 
-        walker_list = self._world.get_actors().filter("*walker.pedestrian*")
-        bike_list = [v for v in self._world.get_actors().filter("*vehicle*") ]#if self._is_two_wheeler(v)]
+        walker_list = list(self._world.get_actors().filter("*walker.pedestrian*"))
+        bike_list = [v for v in self._world.get_actors().filter("*vehicle*") if self._is_two_wheeler(v)]
         hazard_list = walker_list + bike_list
 
         def dist(w): return w.get_location().distance(waypoint.transform.location)
