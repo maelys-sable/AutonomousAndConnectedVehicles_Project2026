@@ -72,11 +72,25 @@ class BehaviorAgent(BasicAgent):
         self._bypass_state = 'idle'
         self._bypass_origin_waypoint = None
 
+        self._actors = None
+
+    def _refresh_actor_snapshot(self):
+        """
+        Retrieves all actors in the scene just once per tick.
+
+        `world.get_actors()` is an RPC call to the simulator, not a simple local read. 
+        Calling it separately in each manager (pedestrians, vehicles, routing, etc.) 
+        unnecessarily multiplies the number of network round trips per tick; with heavy 
+        traffic, this may be enough to trigger the simulator’s watchdog.
+        """
+        self._actors = self._world.get_actors()
+
     def _update_information(self):
         """
         This method updates the information regarding the ego
         vehicle based on the surrounding world.
         """
+        self._refresh_actor_snapshot()
         self._speed = get_speed(self._vehicle)
         self._speed_limit = self._vehicle.get_speed_limit()
         self._local_planner.set_speed(self._speed_limit)
@@ -95,7 +109,7 @@ class BehaviorAgent(BasicAgent):
         """
         This method is in charge of behaviors for red lights.
         """
-        actor_list = self._world.get_actors()
+        actor_list = self._actors
         lights_list = actor_list.filter("*traffic_light*")
         affected, _ = self._affected_by_traffic_light(lights_list)
 
@@ -152,7 +166,7 @@ class BehaviorAgent(BasicAgent):
             :return: list of obstacle agents within the given range
         """
         max_distance = self.OBSTACLE_MAX_DISTANCE if max_distance is None else max_distance
-        actors = self._world.get_actors()
+        actors = self._actors
         obstacle_list = list(actors.filter("*vehicle*")) + list(actors.filter("*static.prop*"))
 
         def dist(v): return v.get_location().distance(waypoint.transform.location)
@@ -254,7 +268,7 @@ class BehaviorAgent(BasicAgent):
             :param waypoint: the agent’s current waypoint
             :return: tuple (vehicle_state, vehicle, distance)
         """
-        actors = self._world.get_actors().filter("*vehicle*")
+        actors = self._actors.filter("*vehicle*")
         def dist(v): return v.get_location().distance(waypoint.transform.location)
         vehicle_list = [v for v in actors if dist(v) < self.BYPASS_DETECTION_DISTANCE and v.id != self._vehicle.id]
         return self._vehicle_obstacle_detected(
@@ -380,7 +394,7 @@ class BehaviorAgent(BasicAgent):
             :return distance: distance to nearby walker
         """
 
-        walker_list = self._world.get_actors().filter("*walker.pedestrian*")
+        walker_list = self._actors.filter("*walker.pedestrian*")
         def dist(w): return w.get_location().distance(waypoint.transform.location)
         walker_list = [w for w in walker_list if dist(w) < 10]
 
