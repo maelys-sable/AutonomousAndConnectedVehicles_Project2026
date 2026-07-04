@@ -30,6 +30,10 @@ class BehaviorAgent(BasicAgent):
     are encoded in the agent, from cautious to a more aggressive ones.
     """
 
+    OBSTACLE_MAX_DISTANCE = 45
+    FORWARD_ANGLE_STRAIGHT = 30
+    FORWARD_ANGLE_TURN = 60
+
     def __init__(self, vehicle, behavior='normal', opt_dict={}, map_inst=None, grp_inst=None):
         """
         Constructor method.
@@ -128,6 +132,67 @@ class BehaviorAgent(BasicAgent):
                     self.set_destination(end_waypoint.transform.location,
                                          left_wpt.transform.location)
 
+    def _build_obstacle_list(self, waypoint, max_distance=None):
+        """
+        Builds the extended list of obstacles to monitor: vehicles
+        (including cyclists, who are ‘vehicle’-type agents in
+        CARLA) and static objects (e.g. a DynamicObjectCrossing container).
+
+            :param waypoint: the agent’s current waypoint
+            :param max_distance: detection range (default OBSTACLE_MAX_DISTANCE)
+            :return: list of obstacle agents within the given range
+        """
+        max_distance = self.OBSTACLE_MAX_DISTANCE if max_distance is None else max_distance
+        actors = self._world.get_actors()
+        obstacle_list = list(actors.filter("*vehicle*")) + list(actors.filter("*static.prop*"))
+
+        def dist(v): return v.get_location().distance(waypoint.transform.location)
+        return [v for v in obstacle_list if dist(v) < max_distance and v.id != self._vehicle.id]
+
+    def _is_in_turn(self):
+        """
+        Indicates whether the vehicle is approaching or negotiating a bend.
+
+            :return: True if the direction of travel is a left/right bend
+        """
+        return self._incoming_direction in (RoadOption.LEFT, RoadOption.RIGHT)
+
+    def _forward_detection_angle(self):
+        """
+        Frontal detection angle to be used: widened when cornering to detect
+        lateral obstacles (cyclists, encroaching vehicles,
+        crossing objects) earlier.
+
+            :return: detection angle (degrees)
+        """
+        return self.FORWARD_ANGLE_TURN if self._is_in_turn() else self.FORWARD_ANGLE_STRAIGHT
+
+    def _lane_change_obstacle_detected(self, vehicle_list, lane_offset):
+        """
+        Detects an obstacle occupying the target lane during a lane change.
+
+            :param vehicle_list: list of obstacles to consider
+            :param lane_offset: -1 for the left-hand lane, 1 for the right-hand lane
+            :return: tuple (vehicle_state, vehicle, distance)
+        """
+        return self._vehicle_obstacle_detected(
+            vehicle_list, max(
+                self._behavior.min_proximity_threshold, self._speed_limit / 2),
+            up_angle_th=180, lane_offset=lane_offset)
+
+    def _forward_obstacle_detected(self, vehicle_list):
+        """
+        Detects an obstacle approaching head-on, with an expanded detection angle
+        when cornering (see `_forward_detection_angle`).
+
+            :param vehicle_list: list of obstacles to consider
+            :return: tuple (vehicle_state, vehicle, distance)
+        """
+        return self._vehicle_obstacle_detected(
+            vehicle_list, max(
+                self._behavior.min_proximity_threshold, self._speed_limit / 3),
+            up_angle_th=self._forward_detection_angle())
+
     def collision_and_car_avoid_manager(self, waypoint):
         """
         This module is in charge of warning in case of a collision
@@ -140,22 +205,14 @@ class BehaviorAgent(BasicAgent):
             :return distance: distance to nearby vehicle
         """
 
-        vehicle_list = self._world.get_actors().filter("*vehicle*")
-        def dist(v): return v.get_location().distance(waypoint.transform.location)
-        vehicle_list = [v for v in vehicle_list if dist(v) < 45 and v.id != self._vehicle.id]
+        vehicle_list = self._build_obstacle_list(waypoint)
 
         if self._direction == RoadOption.CHANGELANELEFT:
-            vehicle_state, vehicle, distance = self._vehicle_obstacle_detected(
-                vehicle_list, max(
-                    self._behavior.min_proximity_threshold, self._speed_limit / 2), up_angle_th=180, lane_offset=-1)
+            vehicle_state, vehicle, distance = self._lane_change_obstacle_detected(vehicle_list, lane_offset=-1)
         elif self._direction == RoadOption.CHANGELANERIGHT:
-            vehicle_state, vehicle, distance = self._vehicle_obstacle_detected(
-                vehicle_list, max(
-                    self._behavior.min_proximity_threshold, self._speed_limit / 2), up_angle_th=180, lane_offset=1)
+            vehicle_state, vehicle, distance = self._lane_change_obstacle_detected(vehicle_list, lane_offset=1)
         else:
-            vehicle_state, vehicle, distance = self._vehicle_obstacle_detected(
-                vehicle_list, max(
-                    self._behavior.min_proximity_threshold, self._speed_limit / 3), up_angle_th=30)
+            vehicle_state, vehicle, distance = self._forward_obstacle_detected(vehicle_list)
 
             # Check for tailgating
             if not vehicle_state and self._direction == RoadOption.LANEFOLLOW \
