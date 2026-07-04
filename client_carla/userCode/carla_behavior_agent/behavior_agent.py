@@ -34,6 +34,9 @@ class BehaviorAgent(BasicAgent):
     FORWARD_ANGLE_STRAIGHT = 30
     FORWARD_ANGLE_TURN = 60
 
+    BYPASS_DETECTION_DISTANCE = 80
+    BYPASS_MIN_GAP_TIME = 4.0
+
     def __init__(self, vehicle, behavior='normal', opt_dict={}, map_inst=None, grp_inst=None):
         """
         Constructor method.
@@ -65,6 +68,10 @@ class BehaviorAgent(BasicAgent):
         elif behavior == 'aggressive':
             self._behavior = Aggressive()
 
+        # Cycle : 'idle' -> 'waiting_gap' -> 'overtaking' -> 'returning' -> 'idle'
+        self._bypass_state = 'idle'
+        self._bypass_origin_waypoint = None
+
     def _update_information(self):
         """
         This method updates the information regarding the ego
@@ -93,6 +100,8 @@ class BehaviorAgent(BasicAgent):
         affected, _ = self._affected_by_traffic_light(lights_list)
 
         return affected
+
+#----------------------------------------------------------------------------------------------#
 
     def _tailgating(self, waypoint, vehicle_list):
         """
@@ -222,6 +231,143 @@ class BehaviorAgent(BasicAgent):
 
         return vehicle_state, vehicle, distance
 
+#----------------------------------------------------------------------------------------------#
+
+    def _static_obstacle_ahead(self, waypoint):
+        """
+        Detects a static obstacle (roadworks, accident, parked vehicle)
+        blocking the agent’s path, within the detour range.
+
+            :param waypoint: the agent’s current waypoint
+            :return: tuple (obstacle_state, obstacle, distance)
+        """
+        obstacle_list = self._build_obstacle_list(waypoint, max_distance=self.BYPASS_DETECTION_DISTANCE)
+        static_list = [o for o in obstacle_list if "static.prop" in o.type_id]
+        return self._vehicle_obstacle_detected(
+            static_list, self.BYPASS_DETECTION_DISTANCE, up_angle_th=self.FORWARD_ANGLE_STRAIGHT)
+
+    def _oncoming_lane_obstacle(self, waypoint):
+        """
+        Detects a vehicle travelling in the opposite direction on the opposite carriageway,
+        used to search for a gap before overtaking.
+
+            :param waypoint: the agent’s current waypoint
+            :return: tuple (vehicle_state, vehicle, distance)
+        """
+        actors = self._world.get_actors().filter("*vehicle*")
+        def dist(v): return v.get_location().distance(waypoint.transform.location)
+        vehicle_list = [v for v in actors if dist(v) < self.BYPASS_DETECTION_DISTANCE and v.id != self._vehicle.id]
+        return self._vehicle_obstacle_detected(
+            vehicle_list, self.BYPASS_DETECTION_DISTANCE, up_angle_th=180, lane_offset=-1)
+
+    def _gap_is_safe(self, oncoming_distance, oncoming_speed):
+        """
+        Assesses whether there is a sufficient gap in oncoming traffic to
+        merge (gap detection / gap acceptance).
+
+            :param oncoming_distance: distance to the oncoming vehicle (m), None/-1 if not available
+            :param oncoming_speed: speed of the oncoming vehicle (km/h)
+            :return: True if the gap is deemed safe
+        """
+        if oncoming_distance is None or oncoming_distance < 0:
+            return True  # no vehiclle detected : free line
+
+        speed_ms = oncoming_speed / 3.6
+        if speed_ms <= 0:
+            return True  # vehicle stopped : no imminent risk of frontal collision
+
+        time_to_arrival = oncoming_distance / speed_ms
+        return time_to_arrival >= self.BYPASS_MIN_GAP_TIME
+
+    def _can_start_bypass(self, waypoint):
+        """
+        Determines whether the agent can move onto the opposite lane to
+        go round the detected obstacle (if the lane is clear or there is sufficient space).
+
+            :param waypoint: the agent’s current waypoint
+            :return: True if the manoeuvre can begin
+        """
+        oncoming_state, oncoming_vehicle, oncoming_distance = self._oncoming_lane_obstacle(waypoint)
+        if not oncoming_state:
+            return True
+        return self._gap_is_safe(oncoming_distance, get_speed(oncoming_vehicle))
+
+    def _start_bypass_maneuver(self, waypoint):
+        """
+        Triggers a lateral shift to the opposite lane to bypass the obstacle 
+        (same mechanism as `_tailgating`: redefine the local destination to the adjacent lane).
+
+            :param waypoint: the agent’s current waypoint
+        """
+        opposite_wpt = waypoint.get_left_lane()
+        end_waypoint = self._local_planner.target_waypoint
+        self.set_destination(end_waypoint.transform.location, opposite_wpt.transform.location)
+
+    def _obstacle_cleared(self, waypoint):
+        """
+        Indicates whether the obstacle that was bypassed has now been passed 
+        (no longer detected in front of the agent).
+
+            :param waypoint: the agent’s current waypoint
+            :return: True if the obstacle is no longer a frontal obstacle
+        """
+        obstacle_state, _, _ = self._static_obstacle_ahead(waypoint)
+        return not obstacle_state
+
+    def _back_on_original_lane(self, waypoint):
+        """
+        Indicates whether the agent has returned to its original path after taking a detour.
+
+            :param waypoint: the agent’s current waypoint
+            :return: True if the current path matches the starting path
+        """
+        return (self._bypass_origin_waypoint is not None
+                and waypoint.lane_id == self._bypass_origin_waypoint.lane_id)
+
+    def _reset_bypass_state(self):
+        """Resets the status of the bypass module."""
+        self._bypass_state = 'idle'
+        self._bypass_origin_waypoint = None
+
+    def bypass_obstacle_manager(self, waypoint):
+        """
+        Generic module for static obstacle avoidance. Drives the cycle of
+        detection → waiting for a gap → avoidance → return
+        to the route.
+
+            :param waypoint: the agent’s current waypoint
+            :return: True if a bypass manoeuvre is in progress (the caller
+                     must then allow the local planner to follow the new
+                     destination rather than applying the normal behaviour)
+        """
+        if self._bypass_state == 'idle':
+            obstacle_state, _, _ = self._static_obstacle_ahead(waypoint)
+            if obstacle_state:
+                self._bypass_origin_waypoint = waypoint
+                self._bypass_state = 'waiting_gap'
+            return self._bypass_state != 'idle'
+
+        if self._bypass_state == 'waiting_gap':
+            if self._can_start_bypass(waypoint):
+                self._start_bypass_maneuver(waypoint)
+                self._bypass_state = 'overtaking'
+            return True
+
+        if self._bypass_state == 'overtaking':
+            if self._obstacle_cleared(waypoint):
+                self._bypass_state = 'returning'
+            return True
+
+        if self._bypass_state == 'returning':
+            if self._back_on_original_lane(waypoint):
+                self._reset_bypass_state()
+                return False
+            return True
+
+        return False
+
+#----------------------------------------------------------------------------------------------#
+
     def pedestrian_avoid_manager(self, waypoint):
         """
         This module is in charge of warning in case of a collision
@@ -249,6 +395,8 @@ class BehaviorAgent(BasicAgent):
                 self._behavior.min_proximity_threshold, self._speed_limit / 3), up_angle_th=60)
 
         return walker_state, walker, distance
+
+#----------------------------------------------------------------------------------------------#
 
     def car_following_manager(self, vehicle, distance, debug=False):
         """
@@ -293,6 +441,8 @@ class BehaviorAgent(BasicAgent):
 
         return control
 
+#----------------------------------------------------------------------------------------------#
+
     def run_step(self, debug=False):
         """
         Execute one step of navigation.
@@ -327,7 +477,15 @@ class BehaviorAgent(BasicAgent):
             if distance < self._behavior.braking_distance:
                 return self.emergency_stop()
 
-        # 2.2: Car following behaviors
+        # 2.2: Static obstacle bypass behavior (construction/accident/parked vehicle)
+        if self.bypass_obstacle_manager(ego_vehicle_wp):
+            target_speed = min([
+                self._behavior.max_speed,
+                self._speed_limit - self._behavior.speed_lim_dist])
+            self._local_planner.set_speed(target_speed)
+            return self._local_planner.run_step(debug=debug)
+
+        # 2.3: Car following behaviors
         vehicle_state, vehicle, distance = self.collision_and_car_avoid_manager(ego_vehicle_wp)
 
         if vehicle_state:

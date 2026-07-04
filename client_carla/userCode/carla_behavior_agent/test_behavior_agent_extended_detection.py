@@ -8,11 +8,6 @@ remplacés par de petits stubs qui reproduisent uniquement l'interface dont
 `behavior_agent.py` a besoin. `BehaviorAgent` est instancié sans passer par
 `__init__` (qui nécessite un vrai monde CARLA), afin de tester chaque
 nouvelle fonction de manière isolée.
-
-Lancement :
-    python -m pytest test_behavior_agent_extended_detection.py -v
-ou simplement :
-    python test_behavior_agent_extended_detection.py
 """
 
 import sys
@@ -234,6 +229,8 @@ def make_agent(world_actors, ego_location=None, incoming_direction=RoadOption.LA
     agent._speed = speed
     agent._direction = direction
     agent._incoming_direction = incoming_direction
+    agent._bypass_state = 'idle'
+    agent._bypass_origin_waypoint = None
     return agent
 
 
