@@ -17,17 +17,6 @@ from behavior_types import Cautious, Aggressive, Normal
 
 from misc import get_speed, positive, is_within_distance, compute_distance
 
-
-_TWO_WHEELER_PREFIXES = (
-    'vehicle.bh.crossbike',
-    'vehicle.diamondback.century',
-    'vehicle.gazelle.omafiets',
-    'vehicle.harley-davidson.low_rider',
-    'vehicle.kawasaki.ninja',
-    'vehicle.yamaha.yzf',
-    'vehicle.vespa.zx125',
-)
-
 class BehaviorAgent(BasicAgent):
     """
     BehaviorAgent implements an agent that navigates scenes to reach a given
@@ -61,7 +50,6 @@ class BehaviorAgent(BasicAgent):
         self._min_speed = 5
         self._behavior = None
         self._sampling_resolution = 4.5
-        self._overtake_state = 'IDLE'
 
         # Parameters for agent behavior
         if behavior == 'cautious':
@@ -152,8 +140,7 @@ class BehaviorAgent(BasicAgent):
             :return distance: distance to nearby vehicle
         """
 
-        vehicle_list = list(self._world.get_actors().filter("*vehicle*")) + \
-               list(self._world.get_actors().filter("*static.prop*"))
+        vehicle_list = self._world.get_actors().filter("*vehicle*")
         def dist(v): return v.get_location().distance(waypoint.transform.location)
         vehicle_list = [v for v in vehicle_list if dist(v) < 45 and v.id != self._vehicle.id]
 
@@ -178,42 +165,33 @@ class BehaviorAgent(BasicAgent):
 
         return vehicle_state, vehicle, distance
 
-    def _is_two_wheeler(self, actor):
-        return actor.type_id.startswith(_TWO_WHEELER_PREFIXES)
-
     def pedestrian_avoid_manager(self, waypoint):
-        walker_list = list(self._world.get_actors().filter("*walker.pedestrian*"))
-        bike_list = [v for v in self._world.get_actors().filter("*vehicle*") if self._is_two_wheeler(v)]
-        hazard_list = walker_list + bike_list
+        """
+        This module is in charge of warning in case of a collision
+        with any pedestrian.
 
-        # Log seulement si le nombre de vélos suivis change
-        if len(bike_list) != getattr(self, '_last_bike_count', -1):
-            print(f"[BikeDetect] {len(bike_list)} vélo(s) suivi(s): {[b.type_id for b in bike_list]}")
-            self._last_bike_count = len(bike_list)
+            :param location: current location of the agent
+            :param waypoint: current waypoint of the agent
+            :return vehicle_state: True if there is a walker nearby, False if not
+            :return vehicle: nearby walker
+            :return distance: distance to nearby walker
+        """
 
+        walker_list = self._world.get_actors().filter("*walker.pedestrian*")
         def dist(w): return w.get_location().distance(waypoint.transform.location)
-        hazard_list = [w for w in hazard_list if dist(w) < 20]
+        walker_list = [w for w in walker_list if dist(w) < 10]
 
         if self._direction == RoadOption.CHANGELANELEFT:
-            state, obj, distance = self._vehicle_obstacle_detected(hazard_list, max(
+            walker_state, walker, distance = self._vehicle_obstacle_detected(walker_list, max(
                 self._behavior.min_proximity_threshold, self._speed_limit / 2), up_angle_th=90, lane_offset=-1)
         elif self._direction == RoadOption.CHANGELANERIGHT:
-            state, obj, distance = self._vehicle_obstacle_detected(hazard_list, max(
+            walker_state, walker, distance = self._vehicle_obstacle_detected(walker_list, max(
                 self._behavior.min_proximity_threshold, self._speed_limit / 2), up_angle_th=90, lane_offset=1)
         else:
-            state, obj, distance = self._vehicle_obstacle_detected(hazard_list, max(
-                self._behavior.min_proximity_threshold, self._speed_limit / 3), up_angle_th=90)
+            walker_state, walker, distance = self._vehicle_obstacle_detected(walker_list, max(
+                self._behavior.min_proximity_threshold, self._speed_limit / 3), up_angle_th=60)
 
-        # Log seulement quand le danger apparaît/disparaît, pas à chaque tick
-        was_danger = getattr(self, '_last_danger_state', False)
-        if state != was_danger:
-            if state:
-                print(f"[BikeDetect] DANGER détecté: {obj.type_id} à {distance:.1f}m")
-            else:
-                print(f"[BikeDetect] Danger écarté")
-            self._last_danger_state = state
-
-        return state, obj, distance
+        return walker_state, walker, distance
 
     def car_following_manager(self, vehicle, distance, debug=False):
         """
@@ -258,199 +236,6 @@ class BehaviorAgent(BasicAgent):
 
         return control
 
-    def _obstacle_still_present(self, road_id, lane_id, max_check_distance=None):
-        all_props = self._world.get_actors().filter("static.prop.*")
-        ego_loc = self._vehicle.get_location()
-        ego_fwd = self._vehicle.get_transform().get_forward_vector()
-        for prop in all_props:
-            prop_wp = self._map.get_waypoint(prop.get_location(), lane_type=carla.LaneType.Any)
-            if prop_wp.road_id == road_id and prop_wp.lane_id == lane_id:
-                to_prop = prop.get_location() - ego_loc
-                longitudinal = to_prop.x * ego_fwd.x + to_prop.y * ego_fwd.y
-                if longitudinal > 0:
-                    if max_check_distance is None or prop.get_location().distance(ego_loc) < max_check_distance:
-                        return True
-        return False
-
-    def _oncoming_lane_clear(self, lane_offset=-1, max_distance=40.0):
-        """
-        Vérifie en temps réel si la voie opposée est libre de tout véhicule venant
-        en face. Doit être appelée à CHAQUE tick pendant tout le dépassement,
-        pas seulement au moment de décider de le commencer.
-        """
-        all_vehicles = list(self._world.get_actors().filter("*vehicle*"))
-        lane_blocked, blocker, blocker_dist = self._vehicle_obstacle_detected(
-            all_vehicles, max_distance=max_distance, up_angle_th=180, lane_offset=lane_offset
-        )
-        return not lane_blocked, blocker
-
-    def overtake_manager(self, ego_wp, vehicle=None, distance=None):
-        """
-        Contrôleur réactif de dépassement. Appelé à chaque tick tant qu'un
-        dépassement est en cours ou nécessaire. Contrairement à l'ancien plan
-        figé, il réévalue à chaque tick :
-        - si un véhicule arrive en face (abandon/pause du dépassement)
-        - si l'obstacle d'origine est encore là (moment de rentrer dans la voie)
-
-        États : 'IDLE' -> 'CROSSING' -> 'MERGING_BACK' -> 'IDLE'
-        """
-
-        # --- État 1 : pas encore en dépassement, on évalue s'il faut en démarrer un ---
-        if self._overtake_state == 'IDLE':
-            if vehicle is None or 'static.prop' not in vehicle.type_id:
-                return None
-            if self._speed > 8.0 or distance > 30.0:
-                return None
-
-            clear, blocker = self._oncoming_lane_clear(lane_offset=-1)
-            if not clear:
-                print(f"[Overtake] En attente : véhicule en face ({blocker.type_id if blocker else '?'})")
-                return self.emergency_stop()
-
-            target_wp = ego_wp.get_left_lane()
-            if target_wp is None or target_wp.lane_type != carla.LaneType.Driving:
-                print("[Overtake] Pas de voie opposée exploitable")
-                return None
-
-            self._overtake_state = 'CROSSING'
-            self._original_lane_id = ego_wp.lane_id 
-            self._original_road_id = ego_wp.road_id
-            self._pre_overtake_plan = list(self._local_planner.get_plan())
-            print("[Overtake] Départ du dépassement sur la gauche")
-            # continue directement en CROSSING sur ce même tick
-
-        # --- État 2 : on roule sur la voie opposée, tant que l'obstacle est encore là ---
-        if self._overtake_state == 'CROSSING':
-            clear, blocker = self._oncoming_lane_clear(lane_offset=-1, max_distance=25.0)
-            if not clear:
-                print(f"[Overtake] Véhicule en face détecté en pleine traversée "
-                    f"({blocker.type_id if blocker else '?'}) — freinage")
-                return self.emergency_stop()
-
-            self._crossing_tick_counter = getattr(self, '_crossing_tick_counter', 0) + 1
-
-            need_new_plan = (
-                not hasattr(self, '_crossing_plan_ticks')
-                or self._crossing_tick_counter - self._crossing_plan_ticks >= 15
-            )
-
-            if need_new_plan:
-                current_ego_wp = self._map.get_waypoint(self._vehicle.get_location())
-                left_wp = current_ego_wp.get_left_lane()
-                if left_wp is None or left_wp.lane_type != carla.LaneType.Driving:
-                    left_wp = current_ego_wp
-
-                plan = [(left_wp, RoadOption.CHANGELANELEFT)]
-                step_wp = left_wp
-                for _ in range(10):          # horizon ~30 m au lieu de ~9 m
-                    nexts = step_wp.next(3.0)
-                    if not nexts:
-                        break
-                    step_wp = nexts[0]
-                    plan.append((step_wp, RoadOption.LANEFOLLOW))
-
-                self._local_planner.set_global_plan(plan, stop_waypoint_creation=True, clean_queue=True)
-                self._local_planner.set_speed(15)
-                self._crossing_plan_ticks = self._crossing_tick_counter
-
-            still_present = self._obstacle_still_present(self._original_road_id, self._original_lane_id)
-
-            control = self._local_planner.run_step()
-
-            if self._crossing_tick_counter % 20 == 0:
-                print(f"[Overtake][CROSSING] speed={self._speed:.1f} "
-                    f"steer={control.steer:.3f} throttle={control.throttle:.2f} "
-                    f"still_present={still_present}")
-
-            if not still_present:
-                self._overtake_state = 'MERGING_BACK'
-                self._crossing_tick_counter = 0
-                if hasattr(self, '_crossing_plan_ticks'):
-                    del self._crossing_plan_ticks
-                print("[Overtake] Obstacle dépassé — retour sur la voie d'origine")
-
-            return control
-
-        # --- État 3 : on revient sur la voie d'origine ---
-        if self._overtake_state == 'MERGING_BACK':
-            current_ego_wp = self._map.get_waypoint(self._vehicle.get_location())
-            ego_loc = self._vehicle.get_location()
-
-            target_wp = self._map.get_waypoint_xodr(
-                self._original_road_id, self._original_lane_id, current_ego_wp.s
-            )
-
-            if target_wp is None:
-                target_wp = current_ego_wp
-
-            dist_to_target = target_wp.transform.location.distance(ego_loc)
-
-            if dist_to_target < 1.2:
-                self._merge_confirm_ticks = getattr(self, '_merge_confirm_ticks', 0) + 1
-            else:
-                self._merge_confirm_ticks = 0
-
-            if self._merge_confirm_ticks >= 8:
-                self._overtake_state = 'IDLE'
-                self._merging_tick_counter = 0
-                self._merge_confirm_ticks = 0
-
-                saved_plan = getattr(self, '_pre_overtake_plan', None)
-                if saved_plan:
-                    ego_loc = self._vehicle.get_location()
-                    ego_forward = self._vehicle.get_transform().get_forward_vector()
-
-                    def is_ahead(wp_tuple):
-                        to_wp = wp_tuple[0].transform.location - ego_loc
-                        return (to_wp.x * ego_forward.x + to_wp.y * ego_forward.y) > 0
-
-                    ahead_candidates = [(i, wp) for i, wp in enumerate(saved_plan) if is_ahead(wp)]
-
-                    if ahead_candidates:
-                        closest_idx = min(
-                            ahead_candidates,
-                            key=lambda pair: pair[1][0].transform.location.distance(ego_loc)
-                        )[0]
-                    else:
-                        # Tout le plan sauvegardé est derrière nous : on saute directement à la fin
-                        closest_idx = len(saved_plan) - 1
-
-                    resume_plan = saved_plan[closest_idx + 1:]
-                    if resume_plan:
-                        self._local_planner.set_global_plan(
-                            resume_plan, stop_waypoint_creation=False, clean_queue=True
-                        )
-                    else:
-                        self._local_planner._stop_waypoint_creation = False
-                else:
-                    self._local_planner._stop_waypoint_creation = False
-
-                self._pre_overtake_plan = None
-                print("[Overtake] Retour terminé")
-                return None
-            
-            plan = [(target_wp, RoadOption.CHANGELANERIGHT)]
-            step_wp = target_wp
-            for _ in range(6):
-                nexts = step_wp.next(3.0)
-                if not nexts:
-                    break
-                step_wp = nexts[0]
-                plan.append((step_wp, RoadOption.LANEFOLLOW))
-
-            self._local_planner.set_global_plan(plan, stop_waypoint_creation=True, clean_queue=True)
-            self._local_planner.set_speed(15)
-
-            self._merging_tick_counter = getattr(self, '_merging_tick_counter', 0) + 1
-            if self._merging_tick_counter % 10 == 0:
-                print(f"[Overtake][MERGING_BACK] target_road={self._original_road_id} "
-                      f"target_lane={self._original_lane_id} dist_to_target={dist_to_target:.2f} "
-                      f"confirm_ticks={self._merge_confirm_ticks} speed={self._speed:.1f}")
-
-            return self._local_planner.run_step()
-
-        return None
-
     def run_step(self, debug=False):
         """
         Execute one step of navigation.
@@ -459,22 +244,10 @@ class BehaviorAgent(BasicAgent):
             :return control: carla.VehicleControl
         """
         self._update_information()
-        loc = self._vehicle.get_location()
-        vel = self._vehicle.get_velocity()
-        self._tick_counter_global = getattr(self, '_tick_counter_global', 0) + 1
-        if self._tick_counter_global % 10 == 0:
-            print(f"[Position] tick={self._tick_counter_global} "
-                f"x={loc.x:.2f} y={loc.y:.2f} z={loc.z:.2f} "
-                f"vel=({vel.x:.2f},{vel.y:.2f},{vel.z:.2f}) speed_reported={self._speed:.2f}")
 
         control = None
         if self._behavior.tailgate_counter > 0:
             self._behavior.tailgate_counter -= 1
-        if self._overtake_state != 'IDLE':
-            ego_vehicle_wp = self._map.get_waypoint(self._vehicle.get_location())
-            result = self.overtake_manager(ego_vehicle_wp)
-            if result is not None:
-                return result
 
         ego_vehicle_loc = self._vehicle.get_location()
         ego_vehicle_wp = self._map.get_waypoint(ego_vehicle_loc)
@@ -487,9 +260,13 @@ class BehaviorAgent(BasicAgent):
         walker_state, walker, w_distance = self.pedestrian_avoid_manager(ego_vehicle_wp)
 
         if walker_state:
+            # Distance is computed from the center of the two cars,
+            # we use bounding boxes to calculate the actual distance
             distance = w_distance - max(
                 walker.bounding_box.extent.y, walker.bounding_box.extent.x) - max(
                     self._vehicle.bounding_box.extent.y, self._vehicle.bounding_box.extent.x)
+
+            # Emergency brake if the car is very close.
             if distance < self._behavior.braking_distance:
                 return self.emergency_stop()
 
@@ -497,14 +274,13 @@ class BehaviorAgent(BasicAgent):
         vehicle_state, vehicle, distance = self.collision_and_car_avoid_manager(ego_vehicle_wp)
 
         if vehicle_state:
+            # Distance is computed from the center of the two cars,
+            # we use bounding boxes to calculate the actual distance
             distance = distance - max(
                 vehicle.bounding_box.extent.y, vehicle.bounding_box.extent.x) - max(
                     self._vehicle.bounding_box.extent.y, self._vehicle.bounding_box.extent.x)
 
-            result = self.overtake_manager(ego_vehicle_wp, vehicle, distance)
-            if result is not None:
-                return result
-
+            # Emergency brake if the car is very close.
             if distance < self._behavior.braking_distance:
                 return self.emergency_stop()
             else:
@@ -512,14 +288,17 @@ class BehaviorAgent(BasicAgent):
 
         # 3: Intersection behavior
         elif self._incoming_waypoint.is_junction and (self._incoming_direction in [RoadOption.LEFT, RoadOption.RIGHT]):
-            target_speed = min([self._behavior.max_speed, self._speed_limit - 5])
+            target_speed = min([
+                self._behavior.max_speed,
+                self._speed_limit - 5])
             self._local_planner.set_speed(target_speed)
             control = self._local_planner.run_step(debug=debug)
-            
 
         # 4: Normal behavior
         else:
-            target_speed = min([self._behavior.max_speed, self._speed_limit - self._behavior.speed_lim_dist])
+            target_speed = min([
+                self._behavior.max_speed,
+                self._speed_limit - self._behavior.speed_lim_dist])
             self._local_planner.set_speed(target_speed)
             control = self._local_planner.run_step(debug=debug)
 
