@@ -40,6 +40,10 @@ class BehaviorAgent(BasicAgent):
     STATE_LOG_INTERVAL = 20
     BYPASS_TIMEOUT_TICKS = 800
 
+    JUNCTION_DETECTION_DISTANCE = 30
+    JUNCTION_MIN_GAP_TIME = 3.0
+    JUNCTION_TIMEOUT_TICKS = 300
+
     def __init__(self, vehicle, behavior='normal', opt_dict={}, map_inst=None, grp_inst=None):
         """
         Constructor method.
@@ -80,6 +84,10 @@ class BehaviorAgent(BasicAgent):
 
         self._tick_count = 0
         self._scenario_result = None
+
+        # Cycle : 'idle' -> 'waiting_clear' -> 'crossing' -> 'idle'
+        self._junction_state = 'idle'
+        self._junction_tick_counter = 0
 
     def _refresh_actor_snapshot(self):
         """
@@ -329,15 +337,22 @@ class BehaviorAgent(BasicAgent):
         return self._vehicle_obstacle_detected(
             vehicle_list, self.BYPASS_DETECTION_DISTANCE, up_angle_th=180, lane_offset=-1)
 
-    def _gap_is_safe(self, oncoming_distance, oncoming_speed):
+    def _gap_is_safe(self, oncoming_distance, oncoming_speed, min_gap_time=None):
         """
         Assesses whether there is a sufficient gap in oncoming traffic to
         merge (gap detection / gap acceptance).
 
             :param oncoming_distance: distance to the oncoming vehicle (m), None/-1 if not available
             :param oncoming_speed: speed of the oncoming vehicle (km/h)
+            :param min_gap_time: minimum time-to-arrival required for the gap
+                to be considered safe. Defaults to BYPASS_MIN_GAP_TIME, but
+                callers with a different gap-acceptance threshold (e.g. the
+                junction manager) can override it.
             :return: True if the gap is deemed safe
         """
+        if min_gap_time is None:
+            min_gap_time = self.BYPASS_MIN_GAP_TIME
+
         if oncoming_distance is None or oncoming_distance < 0:
             return True  # no vehiclle detected : free line
 
@@ -346,7 +361,7 @@ class BehaviorAgent(BasicAgent):
             return True  # vehicle stopped : no imminent risk of frontal collision
 
         time_to_arrival = oncoming_distance / speed_ms
-        return time_to_arrival >= self.BYPASS_MIN_GAP_TIME
+        return time_to_arrival >= min_gap_time
 
     def _can_start_bypass(self, waypoint):
         """
@@ -443,6 +458,136 @@ class BehaviorAgent(BasicAgent):
             return True
 
         return False
+
+#----------------------------------------------------------------------------------------------#
+
+    def _junction_ahead(self):
+        """
+        Indicates whether the incoming waypoint is a junction the agent is
+        about to enter by turning (left or right), as opposed to simply
+        driving straight through an intersection.
+
+            :return: True if a turning manoeuvre through a junction is imminent
+        """
+        return self._incoming_waypoint.is_junction and self._incoming_direction in (RoadOption.LEFT, RoadOption.RIGHT)
+
+    def _cross_traffic_obstacle(self, waypoint):
+        """
+        Detects a vehicle blocking or crossing the junction ahead: either a
+        vehicle stuck in the intersection (BlockedIntersection) or one from
+        the transversal traffic flow (NonSignalizedJunctionRightTurn). Both
+        scenarios share the same detection mechanism.
+
+            :param waypoint: the agent's current waypoint
+            :return: tuple (vehicle_state, vehicle, distance)
+        """
+        vehicle_list = self._build_obstacle_list(waypoint, max_distance=self.JUNCTION_DETECTION_DISTANCE)
+        return self._vehicle_obstacle_detected(
+            vehicle_list, self.JUNCTION_DETECTION_DISTANCE, up_angle_th=180)
+
+    def _junction_gap_is_safe(self, obstacle_state, obstacle_vehicle, obstacle_distance):
+        """
+        Assesses whether it is safe to enter/cross the junction: no obstacle
+        at all, a stopped one, or one far/slow enough to leave a large
+        enough gap. Reuses the bypass module's gap-acceptance logic with a
+        junction-specific minimum gap time.
+
+            :param obstacle_state: True if a vehicle is detected at the junction
+            :param obstacle_vehicle: the detected vehicle, if any
+            :param obstacle_distance: distance to the detected vehicle
+            :return: True if the agent may proceed
+        """
+        if not obstacle_state:
+            return True
+        return self._gap_is_safe(obstacle_distance, get_speed(obstacle_vehicle),
+                                  min_gap_time=self.JUNCTION_MIN_GAP_TIME)
+
+    def _junction_timed_out(self):
+        """
+        Increments the junction-wait counter and indicates whether the agent
+        has been waiting too long to enter/cross (prevents the "stuck
+        forever at an intersection" failure mode and the resulting scenario
+        timeout infraction).
+
+            :return: True if the wait is considered excessive
+        """
+        self._junction_tick_counter += 1
+        return self._junction_tick_counter > self.JUNCTION_TIMEOUT_TICKS
+
+    def _reset_junction_state(self):
+        """Resets the status of the junction-crossing module."""
+        self._junction_state = 'idle'
+        self._junction_tick_counter = 0
+
+    def _log_junction_transition(self, event, waypoint=None):
+        """
+        Single entry point for all junction-crossing log messages, mirroring
+        `_log_bypass_transition` so both mechanisms stay easy to tell apart
+        in the logs.
+
+            :param event: 'waiting' | 'clear' | 'timeout'
+            :param waypoint: the agent's current waypoint (optional)
+        """
+        loc = waypoint.transform.location if waypoint is not None else None
+        pos = f" pos=({loc.x:.1f}, {loc.y:.1f})" if loc is not None else ""
+        messages = {
+            'waiting': f"[JUNCTION] Blocked or busy junction ahead{pos} -> waiting for a gap",
+            'clear': f"[JUNCTION] Junction clear{pos} -> proceeding with the turn",
+            'timeout': f"[JUNCTION] TEST FAILED: waited too long at the junction{pos} "
+                       f"(stuck in '{self._junction_state}')",
+        }
+        print(messages[event])
+        if event == 'timeout':
+            self._scenario_result = False
+
+    def junction_manager(self, waypoint):
+        """
+        Generic module for junction crossing. Drives the cycle of
+        detection -> waiting for a clear gap -> crossing, with periodic
+        re-evaluation and a timeout so the agent never waits indefinitely.
+
+            :param waypoint: the agent's current waypoint
+            :return: True if the agent must hold its position (caller should
+                     apply a soft stop instead of driving through the junction)
+        """
+        if not self._junction_ahead():
+            if self._junction_state != 'idle':
+                self._reset_junction_state()
+            return False
+
+        if self._junction_state == 'crossing':
+            # Already committed to the manoeuvre: let the local planner
+            # finish driving through the junction.
+            return False
+
+        if self._junction_state == 'idle':
+            self._junction_state = 'waiting_clear'
+            self._log_junction_transition('waiting', waypoint)
+
+        if self._junction_timed_out():
+            self._log_junction_transition('timeout', waypoint)
+            self._reset_junction_state()
+            return False
+
+        obstacle_state, obstacle_vehicle, obstacle_distance = self._cross_traffic_obstacle(waypoint)
+        if self._junction_gap_is_safe(obstacle_state, obstacle_vehicle, obstacle_distance):
+            self._log_junction_transition('clear', waypoint)
+            self._junction_state = 'crossing'
+            return False
+
+        return True
+
+    def _hold_position(self, debug=False):
+        """
+        Brings the vehicle to a gentle stop while waiting for a safe gap
+        (junction gap acceptance), as opposed to `emergency_stop` which is
+        reserved for imminent-collision braking.
+
+            :param debug: boolean for debugging
+            :return control: carla.VehicleControl
+        """
+        self._local_planner.set_speed(0)
+        return self._local_planner.run_step(debug=debug)
 
 #----------------------------------------------------------------------------------------------#
 
@@ -582,12 +727,15 @@ class BehaviorAgent(BasicAgent):
                 control = self.car_following_manager(vehicle, distance)
 
         # 3: Intersection behavior
-        elif self._incoming_waypoint.is_junction and (self._incoming_direction in [RoadOption.LEFT, RoadOption.RIGHT]):
-            target_speed = min([
-                self._behavior.max_speed,
-                self._speed_limit - 5])
-            self._local_planner.set_speed(target_speed)
-            control = self._local_planner.run_step(debug=debug)
+        elif self._junction_ahead():
+            if self.junction_manager(ego_vehicle_wp):
+                control = self._hold_position(debug=debug)
+            else:
+                target_speed = min([
+                    self._behavior.max_speed,
+                    self._speed_limit - 5])
+                self._local_planner.set_speed(target_speed)
+                control = self._local_planner.run_step(debug=debug)
 
         # 4: Normal behavior
         else:

@@ -224,6 +224,7 @@ def make_agent(world_actors, ego_location=None, incoming_direction=RoadOption.LA
     agent = object.__new__(BehaviorAgent)
     agent._vehicle = ego_vehicle
     agent._world = FakeWorld(world_actors)
+    agent._actors = agent._world.get_actors()
     agent._behavior = sys.modules["behavior_types"].Normal()
     agent._speed_limit = speed_limit
     agent._speed = speed
@@ -231,6 +232,11 @@ def make_agent(world_actors, ego_location=None, incoming_direction=RoadOption.LA
     agent._incoming_direction = incoming_direction
     agent._bypass_state = 'idle'
     agent._bypass_origin_waypoint = None
+    agent._bypass_tick_counter = 0
+    agent._tick_count = 0
+    agent._scenario_result = None
+    agent._junction_state = 'idle'
+    agent._junction_tick_counter = 0
     return agent
 
 
