@@ -37,6 +37,9 @@ class BehaviorAgent(BasicAgent):
     BYPASS_DETECTION_DISTANCE = 80
     BYPASS_MIN_GAP_TIME = 4.0
 
+    STATE_LOG_INTERVAL = 20
+    BYPASS_TIMEOUT_TICKS = 800
+
     def __init__(self, vehicle, behavior='normal', opt_dict={}, map_inst=None, grp_inst=None):
         """
         Constructor method.
@@ -71,8 +74,12 @@ class BehaviorAgent(BasicAgent):
         # Cycle : 'idle' -> 'waiting_gap' -> 'overtaking' -> 'returning' -> 'idle'
         self._bypass_state = 'idle'
         self._bypass_origin_waypoint = None
+        self._bypass_tick_counter = 0
 
         self._actors = None
+
+        self._tick_count = 0
+        self._scenario_result = None
 
     def _refresh_actor_snapshot(self):
         """
@@ -84,6 +91,54 @@ class BehaviorAgent(BasicAgent):
         traffic, this may be enough to trigger the simulator’s watchdog.
         """
         self._actors = self._world.get_actors()
+
+    def _log_vehicle_state(self, waypoint):
+        """
+        Periodically displays the position and velocity of the ego vehicle,
+        so that the course of a test can be replayed without restarting the simulation.
+
+            :param waypoint: the agent’s current waypoint
+        """
+        if self._tick_count % self.STATE_LOG_INTERVAL != 0:
+            return
+        loc = waypoint.transform.location
+        print(f"[STATE] tick={self._tick_count} pos=({loc.x:.1f}, {loc.y:.1f}, {loc.z:.1f}) "
+              f"speed={self._speed:.1f} km/h")
+
+    def _log_bypass_transition(self, event, waypoint=None):
+        """
+        A single entry point for all messages relating to the obstacle-avoidance cycle, 
+        to ensure a consistent format and to make it easy to grep the logs 
+        (e.g. test success/failure).
+
+            :param event: 'detected' | 'gap_found' | 'success' | 'timeout'
+            :param waypoint: the agent’s current waypoint (optional)
+        """
+        loc = waypoint.transform.location if waypoint is not None else None
+        pos = f" pos=({loc.x:.1f}, {loc.y:.1f})" if loc is not None else ""
+        messages = {
+            'detected': f"[BYPASS] Obstacle detected{pos} -> searching for a gap",
+            'gap_found': f"[BYPASS] Gap found{pos} -> start of manoeuvre",
+            'success': f"[BYPASS] TEST SUCCESSFUL: obstacle bypassed, back on track{pos}",
+            'timeout': f"[BYPASS] TEST FAILED: manoeuvre timed out{pos}"
+                       f"(stuck in '{self._bypass_state}')",
+        }
+        print(messages[event])
+        if event == 'success':
+            self._scenario_result = True
+        elif event == 'timeout':
+            self._scenario_result = False
+
+    def _bypass_timed_out(self):
+        """
+        Increments the bypass lock counter and indicates whether the operation
+        has been running for too long (enables detection of a scenario failure
+        without waiting for the route’s global timeout).
+
+            :return: True if the operation is considered to be blocked
+        """
+        self._bypass_tick_counter += 1
+        return self._bypass_tick_counter > self.BYPASS_TIMEOUT_TICKS
 
     def _update_information(self):
         """
@@ -342,6 +397,7 @@ class BehaviorAgent(BasicAgent):
         """Resets the status of the bypass module."""
         self._bypass_state = 'idle'
         self._bypass_origin_waypoint = None
+        self._bypass_tick_counter = 0
 
     def bypass_obstacle_manager(self, waypoint):
         """
@@ -359,12 +415,19 @@ class BehaviorAgent(BasicAgent):
             if obstacle_state:
                 self._bypass_origin_waypoint = waypoint
                 self._bypass_state = 'waiting_gap'
+                self._log_bypass_transition('detected', waypoint)
             return self._bypass_state != 'idle'
+
+        if self._bypass_timed_out():
+            self._log_bypass_transition('timeout', waypoint)
+            self._reset_bypass_state()
+            return False
 
         if self._bypass_state == 'waiting_gap':
             if self._can_start_bypass(waypoint):
                 self._start_bypass_maneuver(waypoint)
                 self._bypass_state = 'overtaking'
+                self._log_bypass_transition('gap_found', waypoint)
             return True
 
         if self._bypass_state == 'overtaking':
@@ -374,6 +437,7 @@ class BehaviorAgent(BasicAgent):
 
         if self._bypass_state == 'returning':
             if self._back_on_original_lane(waypoint):
+                self._log_bypass_transition('success', waypoint)
                 self._reset_bypass_state()
                 return False
             return True
@@ -465,6 +529,7 @@ class BehaviorAgent(BasicAgent):
             :return control: carla.VehicleControl
         """
         self._update_information()
+        self._tick_count += 1
 
         control = None
         if self._behavior.tailgate_counter > 0:
@@ -472,6 +537,7 @@ class BehaviorAgent(BasicAgent):
 
         ego_vehicle_loc = self._vehicle.get_location()
         ego_vehicle_wp = self._map.get_waypoint(ego_vehicle_loc)
+        self._log_vehicle_state(ego_vehicle_wp)
 
         # 1: Red lights and stops behavior
         if self.traffic_light_manager():
