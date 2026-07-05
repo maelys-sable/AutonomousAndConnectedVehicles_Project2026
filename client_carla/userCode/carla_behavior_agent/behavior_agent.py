@@ -53,6 +53,13 @@ class BehaviorAgent(BasicAgent):
     STALL_TIMEOUT_TICKS = 150      # ~7.5s at 20 FPS before it's confirmed stalled
                                     # (long enough not to mistake a stop-sign/queue pause for a wreck)
 
+    # Pedestrian wait (non-blocage indéfini): a loitering pedestrian near the
+    # road (background NPC, not a scripted scenario) can otherwise force an
+    # unconditional, permanent emergency_stop with no re-evaluation.
+    PEDESTRIAN_WAIT_TIMEOUT_TICKS = 200   # ~10s at 20 FPS before creeping past
+    PEDESTRIAN_STATIONARY_SPEED = 0.5     # km/h, considered "not walking"
+    PEDESTRIAN_CREEP_SPEED = 5            # km/h, cautious speed once timed out
+
     def __init__(self, vehicle, behavior='normal', opt_dict={}, map_inst=None, grp_inst=None):
         """
         Constructor method.
@@ -101,6 +108,10 @@ class BehaviorAgent(BasicAgent):
         # Stalled-vehicle tracking (see STALL_TIMEOUT_TICKS)
         self._stalled_vehicle_id = None
         self._stalled_tick_counter = 0
+
+        # Pedestrian wait tracking (see PEDESTRIAN_WAIT_TIMEOUT_TICKS)
+        self._pedestrian_wait_id = None
+        self._pedestrian_wait_tick_counter = 0
 
     def _refresh_actor_snapshot(self):
         """
@@ -694,6 +705,71 @@ class BehaviorAgent(BasicAgent):
 
         return walker_state, walker, distance
 
+    def _update_pedestrian_wait_tracking(self, walker):
+        """
+        Tracks how long the agent has been forced to stop for the same
+        pedestrian, to tell a genuinely crossing/approaching pedestrian
+        apart from one merely loitering near the road (background NPC,
+        sidewalk, bus stop) that should not cause an indefinite freeze.
+
+            :param walker: the pedestrian currently forcing an emergency
+                stop, or None if the agent isn't currently stopped for one
+        """
+        if walker is None:
+            self._pedestrian_wait_id = None
+            self._pedestrian_wait_tick_counter = 0
+            return
+
+        if walker.id != self._pedestrian_wait_id:
+            self._pedestrian_wait_id = walker.id
+            self._pedestrian_wait_tick_counter = 0
+
+        self._pedestrian_wait_tick_counter += 1
+
+    def _pedestrian_wait_timed_out(self):
+        """
+        :return: True once the agent has been stopped for the same
+            pedestrian longer than PEDESTRIAN_WAIT_TIMEOUT_TICKS (prevents
+            an indefinite freeze in front of a stationary/loitering pedestrian).
+        """
+        return self._pedestrian_wait_tick_counter > self.PEDESTRIAN_WAIT_TIMEOUT_TICKS
+
+    def _pedestrian_is_stationary(self, walker):
+        """
+        Indicates whether the pedestrian forcing the stop is essentially
+        not moving (loitering) rather than actively walking, which is what
+        makes a cautious creep-past reasonable once the wait has timed out.
+
+            :param walker: the pedestrian actor
+            :return: True if its speed is below PEDESTRIAN_STATIONARY_SPEED
+        """
+        return get_speed(walker) < self.PEDESTRIAN_STATIONARY_SPEED
+
+    def _log_pedestrian_wait_timeout(self, waypoint=None):
+        """
+        Logs the decision to creep past a pedestrian confirmed stationary
+        after waiting too long, mirroring `_log_bypass_transition` and
+        `_log_junction_transition` so all three "non-blocage indéfini"
+        mechanisms stay equally visible and easy to grep in the logs.
+
+            :param waypoint: the agent's current waypoint (optional)
+        """
+        loc = waypoint.transform.location if waypoint is not None else None
+        pos = f" pos=({loc.x:.1f}, {loc.y:.1f})" if loc is not None else ""
+        print(f"[PEDESTRIAN] Waited too long for a stationary pedestrian{pos} -> creeping past cautiously")
+
+    def _creep_past_pedestrian(self, debug=False):
+        """
+        Resumes driving at a low, cautious speed once the wait for a
+        stationary pedestrian has timed out, instead of remaining fully
+        stopped forever.
+
+            :param debug: boolean for debugging
+            :return control: carla.VehicleControl
+        """
+        self._local_planner.set_speed(self.PEDESTRIAN_CREEP_SPEED)
+        return self._local_planner.run_step(debug=debug)
+
 #----------------------------------------------------------------------------------------------#
 
     def car_following_manager(self, vehicle, distance, debug=False):
@@ -775,7 +851,14 @@ class BehaviorAgent(BasicAgent):
 
             # Emergency brake if the car is very close.
             if distance < self._behavior.braking_distance:
+                self._update_pedestrian_wait_tracking(walker)
+                if self._pedestrian_wait_timed_out() and self._pedestrian_is_stationary(walker):
+                    self._log_pedestrian_wait_timeout(ego_vehicle_wp)
+                    return self._creep_past_pedestrian(debug=debug)
                 return self.emergency_stop()
+            self._update_pedestrian_wait_tracking(None)
+        else:
+            self._update_pedestrian_wait_tracking(None)
 
         # 2.2: Static obstacle bypass behavior (construction/accident/parked vehicle)
         if self.bypass_obstacle_manager(ego_vehicle_wp):
