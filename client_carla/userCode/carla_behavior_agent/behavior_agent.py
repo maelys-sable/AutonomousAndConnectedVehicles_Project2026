@@ -40,9 +40,18 @@ class BehaviorAgent(BasicAgent):
     STATE_LOG_INTERVAL = 20
     BYPASS_TIMEOUT_TICKS = 800
 
+    # Junction crossing (Block 3: BlockedIntersection / NonSignalizedJunctionRightTurn)
     JUNCTION_DETECTION_DISTANCE = 30
     JUNCTION_MIN_GAP_TIME = 3.0
     JUNCTION_TIMEOUT_TICKS = 300
+
+    # Stalled-vehicle detection (AccidentTwoWays with a wrecked vehicle rather
+    # than a static.prop): a vehicle ahead reporting near-zero speed for a
+    # sustained period is treated as a permanent obstacle to bypass, the same
+    # way a construction cone or a parked car already are.
+    STALL_SPEED_THRESHOLD = 1.0    # km/h, considered "not moving"
+    STALL_TIMEOUT_TICKS = 150      # ~7.5s at 20 FPS before it's confirmed stalled
+                                    # (long enough not to mistake a stop-sign/queue pause for a wreck)
 
     def __init__(self, vehicle, behavior='normal', opt_dict={}, map_inst=None, grp_inst=None):
         """
@@ -88,6 +97,10 @@ class BehaviorAgent(BasicAgent):
         # Cycle : 'idle' -> 'waiting_clear' -> 'crossing' -> 'idle'
         self._junction_state = 'idle'
         self._junction_tick_counter = 0
+
+        # Stalled-vehicle tracking (see STALL_TIMEOUT_TICKS)
+        self._stalled_vehicle_id = None
+        self._stalled_tick_counter = 0
 
     def _refresh_actor_snapshot(self):
         """
@@ -323,6 +336,66 @@ class BehaviorAgent(BasicAgent):
         return self._vehicle_obstacle_detected(
             static_list, self.BYPASS_DETECTION_DISTANCE, up_angle_th=self.FORWARD_ANGLE_STRAIGHT)
 
+    def _update_stall_tracking(self, vehicle):
+        """
+        Tracks how long a specific vehicle ahead has been reporting
+        near-zero speed. Distinguishes a genuinely stalled/wrecked vehicle
+        (AccidentTwoWays) from one only briefly stopped (queue, stop sign).
+
+            :param vehicle: the vehicle currently detected ahead, or None
+        """
+        if vehicle is None or get_speed(vehicle) > self.STALL_SPEED_THRESHOLD:
+            self._stalled_vehicle_id = None
+            self._stalled_tick_counter = 0
+            return
+
+        if vehicle.id != self._stalled_vehicle_id:
+            self._stalled_vehicle_id = vehicle.id
+            self._stalled_tick_counter = 0
+
+        self._stalled_tick_counter += 1
+
+    def _stalled_vehicle_confirmed(self):
+        """
+        :return: True once the currently tracked vehicle has been
+            stationary long enough to be treated as a permanent obstacle.
+        """
+        return self._stalled_tick_counter > self.STALL_TIMEOUT_TICKS
+
+    def _stalled_vehicle_ahead(self, waypoint):
+        """
+        Detects a vehicle ahead that has been confirmed stalled (see
+        `_update_stall_tracking`): a wrecked or broken-down vehicle blocking
+        the lane (AccidentTwoWays), as opposed to a static prop already
+        covered by `_static_obstacle_ahead`.
+
+            :param waypoint: the agent's current waypoint
+            :return: tuple (obstacle_state, obstacle, distance)
+        """
+        obstacle_list = self._build_obstacle_list(waypoint, max_distance=self.BYPASS_DETECTION_DISTANCE)
+        vehicle_state, vehicle, distance = self._vehicle_obstacle_detected(
+            obstacle_list, self.BYPASS_DETECTION_DISTANCE, up_angle_th=self.FORWARD_ANGLE_STRAIGHT)
+
+        self._update_stall_tracking(vehicle if vehicle_state else None)
+        if vehicle_state and self._stalled_vehicle_confirmed():
+            return True, vehicle, distance
+        return False, None, -1
+
+    def _blocking_obstacle_ahead(self, waypoint):
+        """
+        Generic entry point for the bypass module: an obstacle to go around
+        is either a static prop (ConstructionObstacleTwoWays, roadworks...)
+        or a vehicle confirmed stalled long enough to be treated the same
+        way (AccidentTwoWays with a wrecked vehicle, a broken-down car...).
+
+            :param waypoint: the agent's current waypoint
+            :return: tuple (obstacle_state, obstacle, distance)
+        """
+        static_state, static_obstacle, static_distance = self._static_obstacle_ahead(waypoint)
+        if static_state:
+            return static_state, static_obstacle, static_distance
+        return self._stalled_vehicle_ahead(waypoint)
+
     def _oncoming_lane_obstacle(self, waypoint):
         """
         Detects a vehicle travelling in the opposite direction on the opposite carriageway,
@@ -395,7 +468,7 @@ class BehaviorAgent(BasicAgent):
             :param waypoint: the agent’s current waypoint
             :return: True if the obstacle is no longer a frontal obstacle
         """
-        obstacle_state, _, _ = self._static_obstacle_ahead(waypoint)
+        obstacle_state, _, _ = self._blocking_obstacle_ahead(waypoint)
         return not obstacle_state
 
     def _back_on_original_lane(self, waypoint):
@@ -413,6 +486,8 @@ class BehaviorAgent(BasicAgent):
         self._bypass_state = 'idle'
         self._bypass_origin_waypoint = None
         self._bypass_tick_counter = 0
+        self._stalled_vehicle_id = None
+        self._stalled_tick_counter = 0
 
     def bypass_obstacle_manager(self, waypoint):
         """
@@ -426,7 +501,7 @@ class BehaviorAgent(BasicAgent):
                      destination rather than applying the normal behaviour)
         """
         if self._bypass_state == 'idle':
-            obstacle_state, _, _ = self._static_obstacle_ahead(waypoint)
+            obstacle_state, _, _ = self._blocking_obstacle_ahead(waypoint)
             if obstacle_state:
                 self._bypass_origin_waypoint = waypoint
                 self._bypass_state = 'waiting_gap'
@@ -726,7 +801,7 @@ class BehaviorAgent(BasicAgent):
             else:
                 control = self.car_following_manager(vehicle, distance)
 
-        # 3: Intersection behavior
+        # 3: Intersection behavior (BlockedIntersection / NonSignalizedJunctionRightTurn)
         elif self._junction_ahead():
             if self.junction_manager(ego_vehicle_wp):
                 control = self._hold_position(debug=debug)
