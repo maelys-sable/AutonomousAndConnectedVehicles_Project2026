@@ -38,6 +38,9 @@ class BehaviorAgent(BasicAgent):
     BYPASS_MIN_GAP_TIME = 4.0
     BYPASS_MANEUVER_SPEED = 25      # km/h cap while alongside the obstacle (props/parked vehicles are close)
     BYPASS_FORWARD_MARGIN = 8       # m, extra stopping margin kept ahead during the manoeuvre
+    BYPASS_CLUSTER_GAP = 12         # m, max gap between two static props to treat them as one group
+    BYPASS_CLEAR_MARGIN = 8         # m, extra distance past the farthest prop of the group before merging back
+    BYPASS_RESUME_DISTANCE = 40     # m ahead on the original lane once the group is cleared
 
     STATE_LOG_INTERVAL = 20
     BYPASS_TIMEOUT_TICKS = 800
@@ -464,31 +467,95 @@ class BehaviorAgent(BasicAgent):
             return True
         return self._gap_is_safe(oncoming_distance, get_speed(oncoming_vehicle))
 
+    def _static_cluster_span(self, waypoint):
+        """
+        Total longitudinal depth of the group of static obstacles ahead: the
+        distance from the agent to the farthest prop still part of the same
+        contiguous cluster (two obstacles more than BYPASS_CLUSTER_GAP apart
+        are treated as separate events). A roadwork/accident scene is
+        frequently made of several close-together props (cone, debris,
+        warning sign) rather than a single one -- sizing the manoeuvre for
+        only the closest one strands the agent between two obstacles still
+        in the group.
+
+            :param waypoint: the agent's current waypoint
+            :return: distance (m) to the far edge of the cluster, or 0 if none
+        """
+        obstacle_list = self._build_obstacle_list(waypoint, max_distance=self.BYPASS_DETECTION_DISTANCE)
+        static_list = sorted(
+            (o for o in obstacle_list if 'static.prop' in o.type_id),
+            key=lambda o: o.get_location().distance(waypoint.transform.location))
+
+        span = 0.0
+        last_dist = None
+        for obstacle in static_list:
+            dist = obstacle.get_location().distance(waypoint.transform.location)
+            if last_dist is not None and (dist - last_dist) > self.BYPASS_CLUSTER_GAP:
+                break
+            span = dist
+            last_dist = dist
+        return span
+
     def _bypass_target_waypoints(self, waypoint):
         """
         Resolves the two waypoints needed to start a bypass: the opposite
-        lane to move into, and the current local-planner target to resume
-        towards afterwards. Either can legitimately be missing (edge of the
-        map, lane ending, planner between targets) -- this must be checked
-        before use, not assumed.
+        lane to move into, and a point on that same opposite lane far
+        enough ahead to clear the whole obstacle cluster (see
+        `_static_cluster_span`), not just the closest prop. Either can
+        legitimately be missing (edge of the map, lane ending) -- this must
+        be checked before use, not assumed.
 
             :param waypoint: the agent's current waypoint
             :return: tuple (opposite_wpt, end_waypoint), either may be None
         """
-        return waypoint.get_left_lane(), self._local_planner.target_waypoint
+        opposite_wpt = waypoint.get_left_lane()
+        if opposite_wpt is None:
+            return None, None
+        reach = self._static_cluster_span(waypoint) + self.BYPASS_CLEAR_MARGIN
+        ahead = opposite_wpt.next(reach)
+        end_waypoint = ahead[0] if ahead else None
+        return opposite_wpt, end_waypoint
 
     def _start_bypass_maneuver(self, waypoint):
         """
-        Triggers a lateral shift to the opposite lane to bypass the obstacle 
-        (same mechanism as `_tailgating`: redefine the local destination to the adjacent lane).
+        Triggers a lateral shift to the opposite lane to bypass the obstacle
+        cluster. Calls `set_destination` with a single argument (the
+        opposite-lane point past the whole cluster): passing a
+        `start_location` there is not reliable -- this agent's
+        `set_destination` silently substitutes the vehicle's current
+        location for it and appends to the existing plan instead of
+        replacing it, so the shift never actually happened. With a single
+        end location on the opposite lane, the global route planner is
+        forced to compute a genuine lane change to reach it.
 
-            :param waypoint: the agent’s current waypoint
+            :param waypoint: the agent's current waypoint
             :return: True if the manoeuvre was actually started
         """
         opposite_wpt, end_waypoint = self._bypass_target_waypoints(waypoint)
         if opposite_wpt is None or end_waypoint is None:
             return False
-        self.set_destination(end_waypoint.transform.location, opposite_wpt.transform.location)
+        self.set_destination(end_waypoint.transform.location)
+        return True
+
+    def _resume_original_lane(self, waypoint):
+        """
+        Issues a fresh destination back on the original lane, well past the
+        cluster. Needed because `set_destination` leaves the local planner's
+        `stop_waypoint_creation` flag set: once the opposite-lane destination
+        used to bypass the cluster is reached, the planner does not
+        generate any further waypoints on its own and simply stops -- which
+        is what left the agent frozen in place after clearing the obstacle
+        instead of continuing the route.
+
+            :param waypoint: the agent's current waypoint
+            :return: True if a new destination was set
+        """
+        origin = self._bypass_origin_waypoint or waypoint
+        ahead = origin.next(self.BYPASS_RESUME_DISTANCE)
+        resume_wpt = ahead[0] if ahead else None
+        if resume_wpt is None:
+            return False
+        self.set_destination(resume_wpt.transform.location)
         return True
 
     def _obstacle_cleared(self, waypoint):
@@ -614,6 +681,10 @@ class BehaviorAgent(BasicAgent):
 
         if self._bypass_state == 'overtaking':
             if self._obstacle_cleared(waypoint):
+                if not self._resume_original_lane(waypoint):
+                    self._log_bypass_transition('aborted', waypoint)
+                    self._reset_bypass_state()
+                    return False
                 self._bypass_state = 'returning'
             return True
 
