@@ -30,6 +30,60 @@ class BehaviorAgent(BasicAgent):
     are encoded in the agent, from cautious to a more aggressive ones.
     """
 
+    # ------------------------------------------------------------------ #
+    # CARTE D'UTILISATION -- point d'entree unique : run_step().         #
+    # Chaque bloc de run_step() delegue a UN manager public ; tout le    #
+    # reste de la classe est un helper prive utilise UNIQUEMENT par le   #
+    # manager cite. Pour savoir si un helper est mort, chercher son nom  #
+    # uniquement dans la section de son manager.                        #
+    #                                                                    #
+    #   run_step()                                                      #
+    #     1. traffic_light_manager()                                    #
+    #     2.1 pedestrian_avoid_manager() + _update_pedestrian_wait_*,    #
+    #         _pedestrian_wait_timed_out, _pedestrian_is_stationary,     #
+    #         _log_pedestrian_wait_timeout, _creep_past_pedestrian       #
+    #     2.2 bypass_obstacle_manager()  (voir sous-carte plus bas)      #
+    #     2.3 collision_and_car_avoid_manager() + car_following_manager, #
+    #         _tailgating, _build_obstacle_list, _forward_obstacle_*,    #
+    #         _lane_change_obstacle_detected, _forward_detection_angle,  #
+    #         _is_in_turn                                                #
+    #     3.  junction_manager() + _junction_ahead, _cross_traffic_*,    #
+    #         _junction_gap_is_safe, _junction_timed_out,                #
+    #         _reset_junction_state, _log_junction_transition,           #
+    #         _hold_position                                             #
+    #                                                                    #
+    #   bypass_obstacle_manager() sous-carte (etats: idle -> nudging OU  #
+    #   waiting_gap -> overtaking -> returning -> idle) :                #
+    #     detection      : _blocking_obstacle_ahead (-> _static_obstacle_#
+    #                      ahead, _stalled_vehicle_ahead + _update_stall_#
+    #                      tracking, _stalled_vehicle_confirmed),        #
+    #                      _obstacles_ahead, _farthest_obstacle_distance #
+    #     dimensionnement : _widest_bypass_offset, _lane_max_offset,     #
+    #                      _obstacle_side_clearance,                     #
+    #                      _obstacle_lateral_offset, _set_lane_offset    #
+    #     nudging        : _bypass_refresh_nudge, _fallback_to_full_     #
+    #                      bypass, _nudge_convergence_speed              #
+    #     gap acceptance : _can_start_bypass, _bypass_side,              #
+    #                      _right_lane_usable, _right_lane_clear,        #
+    #                      _oncoming_lane_obstacle, _gap_is_safe         #
+    #     manoeuvre      : _start_bypass_maneuver, _bypass_target_       #
+    #                      waypoints, _forward_on_lane,                  #
+    #                      _resume_original_lane, _overtaking_transition_#
+    #                      speed                                        #
+    #     sortie         : _obstacle_cleared, _bypass_progress_clear,    #
+    #                      _back_on_original_lane, _bypass_timed_out,    #
+    #                      _reset_bypass_state                          #
+    #     profil/vitesse : _enter_bypass_caution, _exit_bypass_caution,  #
+    #                      _bypass_target_speed, _bypass_convergence_    #
+    #                      speed, _bypass_drive_control,                 #
+    #                      _bypass_forward_clear                        #
+    #     logs           : _log_bypass_transition                       #
+    #                                                                    #
+    #   Appeles a chaque tick, hors arbre ci-dessus :                    #
+    #     _update_information, _refresh_actor_snapshot,                  #
+    #     _log_vehicle_state, emergency_stop                            #
+    # ------------------------------------------------------------------ #
+
     OBSTACLE_MAX_DISTANCE = 45
     FORWARD_ANGLE_STRAIGHT = 30
     FORWARD_ANGLE_TURN = 60
@@ -43,6 +97,17 @@ class BehaviorAgent(BasicAgent):
     BYPASS_OFFSET_MARGIN = 0.4      # m, safety margin kept from the lane edge when nudging in-lane
     BYPASS_OFFSET_CLEARANCE = 0.5   # m, extra clearance wanted past each obstacle's own edge
     BYPASS_MIN_MANEUVER_SPEED = 15  # km/h floor for a nudge that needs most of the lane's width
+    BYPASS_TRANSITION_DISTANCE = 25 # m, distance from the manoeuvre's origin during which the
+                                     # agent is still executing the sharp lateral shift that
+                                     # GlobalRoutePlanner.trace_route produces for a lane-change
+                                     # edge: it jumps straight from the current waypoint to a
+                                     # point several samples into the target lane, with NO
+                                     # smoothing waypoints in between (unlike an in-lane nudge,
+                                     # which ramps the offset gradually). Left uncapped, the
+                                     # Stanley controller was still mid-drift toward the target
+                                     # lane -- short of the width it needed -- by the time the
+                                     # agent reached the obstacle, clipping it (see the collision
+                                     # right after "Gap found -> start of manoeuvre" in the logs).
 
     STATE_LOG_INTERVAL = 20
     BYPASS_TIMEOUT_TICKS = 800
@@ -848,31 +913,17 @@ class BehaviorAgent(BasicAgent):
         """
         return min(self.BYPASS_MANEUVER_SPEED, self._speed_limit - self._behavior.speed_lim_dist)
 
-    def _bypass_convergence_speed(self, waypoint):
+    def _nudge_convergence_speed(self, waypoint, base_speed):
         """
-        Speed cap for a nudge, scaled down further the larger the required
-        in-lane offset is relative to what the lane allows.
-
-        The Stanley lateral controller's correction term is
-        `atan(K_V * lateral_error / (K_S + speed))`: for the same
-        crosstrack error, a LOWER speed gives a STRONGER correction, not
-        a weaker one. `_bypass_target_speed` alone caps every nudge at
-        the same speed regardless of how wide the required offset is, so
-        a nudge sized for a wide static.prop.trafficwarning converges no
-        faster than one sized for a narrow cone -- which is what let the
-        agent still be mid-drift, short of the width it needed, by the
-        time it reached the obstacle. Slowing down further in proportion
-        to how much of the lane's width the manoeuvre actually needs
-        gives the controller more correction authority exactly when it
-        needs to cover more lateral distance.
+        Speed cap for an in-lane nudge, scaled down further the larger the
+        required offset is relative to what the lane allows (see
+        `_bypass_convergence_speed` for why a lower speed gives the Stanley
+        controller more correction authority, not less).
 
             :param waypoint: the agent's current waypoint
+            :param base_speed: uncapped manoeuvre speed (see `_bypass_target_speed`)
             :return: target speed in km/h
         """
-        base_speed = self._bypass_target_speed()
-        if self._bypass_state != 'nudging':
-            return base_speed
-
         offset = self._widest_bypass_offset(waypoint)
         max_offset = self._lane_max_offset(waypoint)
         if offset is None or max_offset <= 0:
@@ -880,6 +931,56 @@ class BehaviorAgent(BasicAgent):
 
         severity = min(abs(offset) / max_offset, 1.0)
         return base_speed - severity * (base_speed - self.BYPASS_MIN_MANEUVER_SPEED)
+
+    def _overtaking_transition_speed(self, waypoint, base_speed):
+        """
+        Speed cap for the first `BYPASS_TRANSITION_DISTANCE` metres of a
+        full lane-level bypass, i.e. the unsmoothed diagonal produced by
+        the global route planner's lane-change edge (see
+        `BYPASS_TRANSITION_DISTANCE`). Once far enough past the origin,
+        the agent is assumed to have straightened out onto the target
+        lane and can resume the normal manoeuvre speed.
+
+            :param waypoint: the agent's current waypoint
+            :param base_speed: uncapped manoeuvre speed (see `_bypass_target_speed`)
+            :return: target speed in km/h
+        """
+        if self._bypass_origin_waypoint is None:
+            return base_speed
+        travelled = waypoint.transform.location.distance(
+            self._bypass_origin_waypoint.transform.location)
+        if travelled < self.BYPASS_TRANSITION_DISTANCE:
+            return self.BYPASS_MIN_MANEUVER_SPEED
+        return base_speed
+
+    def _bypass_convergence_speed(self, waypoint):
+        """
+        Speed cap applied while a bypass manoeuvre needs extra lateral
+        correction authority from the Stanley controller.
+
+        The Stanley lateral controller's correction term is
+        `atan(K_V * lateral_error / (K_S + speed))`: for the same
+        crosstrack error, a LOWER speed gives a STRONGER correction, not
+        a weaker one. `_bypass_target_speed` alone caps every manoeuvre at
+        the same speed regardless of how much lateral distance it needs
+        to cover, which is what let the agent still be mid-drift, short
+        of the width it needed, by the time it reached the obstacle --
+        for an in-lane nudge (`_nudge_convergence_speed`) as much as for
+        the sharp diagonal at the start of a full lane change
+        (`_overtaking_transition_speed`).
+
+            :param waypoint: the agent's current waypoint
+            :return: target speed in km/h
+        """
+        base_speed = self._bypass_target_speed()
+
+        if self._bypass_state == 'nudging':
+            return self._nudge_convergence_speed(waypoint, base_speed)
+
+        if self._bypass_state == 'overtaking':
+            return self._overtaking_transition_speed(waypoint, base_speed)
+
+        return base_speed
 
     def _bypass_forward_clear(self, waypoint):
         """
