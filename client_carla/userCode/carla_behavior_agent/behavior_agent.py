@@ -42,6 +42,7 @@ class BehaviorAgent(BasicAgent):
     BYPASS_RESUME_DISTANCE = 40     # m ahead on the original lane once the group is cleared
     BYPASS_OFFSET_MARGIN = 0.4      # m, safety margin kept from the lane edge when nudging in-lane
     BYPASS_OFFSET_CLEARANCE = 0.5   # m, extra clearance wanted past each obstacle's own edge
+    BYPASS_MIN_MANEUVER_SPEED = 15  # km/h floor for a nudge that needs most of the lane's width
 
     STATE_LOG_INTERVAL = 20
     BYPASS_TIMEOUT_TICKS = 800
@@ -847,6 +848,39 @@ class BehaviorAgent(BasicAgent):
         """
         return min(self.BYPASS_MANEUVER_SPEED, self._speed_limit - self._behavior.speed_lim_dist)
 
+    def _bypass_convergence_speed(self, waypoint):
+        """
+        Speed cap for a nudge, scaled down further the larger the required
+        in-lane offset is relative to what the lane allows.
+
+        The Stanley lateral controller's correction term is
+        `atan(K_V * lateral_error / (K_S + speed))`: for the same
+        crosstrack error, a LOWER speed gives a STRONGER correction, not
+        a weaker one. `_bypass_target_speed` alone caps every nudge at
+        the same speed regardless of how wide the required offset is, so
+        a nudge sized for a wide static.prop.trafficwarning converges no
+        faster than one sized for a narrow cone -- which is what let the
+        agent still be mid-drift, short of the width it needed, by the
+        time it reached the obstacle. Slowing down further in proportion
+        to how much of the lane's width the manoeuvre actually needs
+        gives the controller more correction authority exactly when it
+        needs to cover more lateral distance.
+
+            :param waypoint: the agent's current waypoint
+            :return: target speed in km/h
+        """
+        base_speed = self._bypass_target_speed()
+        if self._bypass_state != 'nudging':
+            return base_speed
+
+        offset = self._widest_bypass_offset(waypoint)
+        max_offset = self._lane_max_offset(waypoint)
+        if offset is None or max_offset <= 0:
+            return base_speed
+
+        severity = min(abs(offset) / max_offset, 1.0)
+        return base_speed - severity * (base_speed - self.BYPASS_MIN_MANEUVER_SPEED)
+
     def _bypass_forward_clear(self, waypoint):
         """
         Checks for a vehicle immediately ahead in the lane currently used
@@ -1235,7 +1269,7 @@ class BehaviorAgent(BasicAgent):
         """
         if not self._bypass_forward_clear(waypoint):
             return self.emergency_stop()
-        self._local_planner.set_speed(self._bypass_target_speed())
+        self._local_planner.set_speed(self._bypass_convergence_speed(waypoint))
         return self._local_planner.run_step(debug=debug)
 
     def car_following_manager(self, vehicle, distance, debug=False):
