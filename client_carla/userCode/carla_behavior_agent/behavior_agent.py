@@ -41,6 +41,8 @@ class BehaviorAgent(BasicAgent):
     BYPASS_CLUSTER_GAP = 12         # m, max gap between two static props to treat them as one group
     BYPASS_CLEAR_MARGIN = 8         # m, extra distance past the farthest prop of the group before merging back
     BYPASS_RESUME_DISTANCE = 40     # m ahead on the original lane once the group is cleared
+    BYPASS_OFFSET_MARGIN = 0.4      # m, safety margin kept from the lane edge when nudging in-lane
+    BYPASS_OFFSET_CLEARANCE = 0.5   # m, extra clearance wanted past each obstacle's own edge
 
     STATE_LOG_INTERVAL = 20
     BYPASS_TIMEOUT_TICKS = 800
@@ -156,6 +158,7 @@ class BehaviorAgent(BasicAgent):
         pos = f" pos=({loc.x:.1f}, {loc.y:.1f})" if loc is not None else ""
         messages = {
             'detected': f"[BYPASS] Obstacle detected{pos} -> searching for a gap",
+            'nudging': f"[BYPASS] In-lane nudge{pos} -> clearing the obstacle without a lane change",
             'gap_found': f"[BYPASS] Gap found{pos} -> start of manoeuvre",
             'success': f"[BYPASS] TEST SUCCESSFUL: obstacle bypassed, back on track{pos}",
             'timeout': f"[BYPASS] TEST FAILED: manoeuvre timed out{pos}"
@@ -467,34 +470,124 @@ class BehaviorAgent(BasicAgent):
             return True
         return self._gap_is_safe(oncoming_distance, get_speed(oncoming_vehicle))
 
-    def _static_cluster_span(self, waypoint):
+    def _static_cluster_members(self, waypoint):
         """
-        Total longitudinal depth of the group of static obstacles ahead: the
-        distance from the agent to the farthest prop still part of the same
-        contiguous cluster (two obstacles more than BYPASS_CLUSTER_GAP apart
-        are treated as separate events). A roadwork/accident scene is
-        frequently made of several close-together props (cone, debris,
-        warning sign) rather than a single one -- sizing the manoeuvre for
-        only the closest one strands the agent between two obstacles still
-        in the group.
+        Static obstacles that form a single contiguous group ahead: two
+        obstacles more than BYPASS_CLUSTER_GAP apart are treated as
+        separate events. A roadwork/accident scene is frequently made of
+        several close-together props (cone, debris, warning sign) rather
+        than a single one.
 
             :param waypoint: the agent's current waypoint
-            :return: distance (m) to the far edge of the cluster, or 0 if none
+            :return: list of obstacles in the cluster, nearest first
         """
         obstacle_list = self._build_obstacle_list(waypoint, max_distance=self.BYPASS_DETECTION_DISTANCE)
         static_list = sorted(
             (o for o in obstacle_list if 'static.prop' in o.type_id),
             key=lambda o: o.get_location().distance(waypoint.transform.location))
 
-        span = 0.0
+        cluster = []
         last_dist = None
         for obstacle in static_list:
             dist = obstacle.get_location().distance(waypoint.transform.location)
             if last_dist is not None and (dist - last_dist) > self.BYPASS_CLUSTER_GAP:
                 break
-            span = dist
+            cluster.append(obstacle)
             last_dist = dist
-        return span
+        return cluster
+
+    def _static_cluster_span(self, waypoint):
+        """
+        Total longitudinal depth of the group of static obstacles ahead:
+        the distance from the agent to the farthest prop still part of the
+        cluster (see `_static_cluster_members`) -- sizing a bypass for only
+        the closest prop strands the agent between two obstacles still in
+        the group.
+
+            :param waypoint: the agent's current waypoint
+            :return: distance (m) to the far edge of the cluster, or 0 if none
+        """
+        cluster = self._static_cluster_members(waypoint)
+        if not cluster:
+            return 0.0
+        return max(o.get_location().distance(waypoint.transform.location) for o in cluster)
+
+    def _lane_max_offset(self, waypoint):
+        """
+        Largest lateral offset (m) the agent can apply while staying
+        inside its own lane: half the lane width minus the vehicle's own
+        half-width and a safety margin.
+
+            :param waypoint: the agent's current waypoint
+            :return: max offset magnitude (m), may be <= 0 on a narrow lane
+        """
+        vehicle_half_width = self._vehicle.bounding_box.extent.y
+        return waypoint.lane_width / 2 - vehicle_half_width - self.BYPASS_OFFSET_MARGIN
+
+    def _obstacle_lateral_offset(self, waypoint, obstacle):
+        """
+        Signed lateral distance (m) from the lane centerline to the
+        obstacle, projected on the lane's right vector (positive = the
+        obstacle sits to the right of center).
+
+            :param waypoint: the agent's current waypoint
+            :param obstacle: the static prop to clear
+            :return: signed lateral offset (m)
+        """
+        obstacle_loc = obstacle.get_location()
+        wp_loc = waypoint.transform.location
+        dx, dy = obstacle_loc.x - wp_loc.x, obstacle_loc.y - wp_loc.y
+        right = waypoint.transform.get_right_vector()
+        return dx * right.x + dy * right.y
+
+    def _static_nudge_offset(self, waypoint):
+        """
+        Lateral offset (m, StanleyLateralController convention: positive =
+        right) needed to clear every member of the obstacle cluster ahead
+        by staying in the current lane, instead of a full lane change onto
+        oncoming traffic -- the earlier approach, which triggered
+        OutsideRouteLanesTest for as long as the manoeuvre lasted. Returns
+        None if at least one member of the cluster takes up too much of
+        the lane width for an in-lane nudge to be safe, in which case the
+        full opposite-lane bypass is still needed as a fallback.
+
+            :param waypoint: the agent's current waypoint
+            :return: offset in metres, or None
+        """
+        cluster = self._static_cluster_members(waypoint)
+        if not cluster:
+            return None
+
+        max_offset = self._lane_max_offset(waypoint)
+        if max_offset <= 0:
+            return None
+
+        left_clearance = right_clearance = 0.0
+        for obstacle in cluster:
+            lateral = self._obstacle_lateral_offset(waypoint, obstacle)
+            half_width = obstacle.bounding_box.extent.y
+            needed = abs(lateral) + half_width + self.BYPASS_OFFSET_CLEARANCE
+            if lateral >= 0:
+                right_clearance = max(right_clearance, needed)
+            else:
+                left_clearance = max(left_clearance, needed)
+
+        # Nudge away from whichever side needs the larger clearance.
+        offset = -right_clearance if right_clearance >= left_clearance else left_clearance
+        if abs(offset) > max_offset:
+            return None
+        return offset
+
+    def _set_lane_offset(self, offset):
+        """
+        Applies a lateral offset to the local planner's Stanley controller
+        without touching the route plan -- the agent keeps following the
+        same lane's waypoints, just displaced sideways, which is why this
+        stays inside the route's lane polygon (no OutsideRouteLanesTest hit).
+
+            :param offset: signed lateral offset in metres (0 to cancel)
+        """
+        self._local_planner._vehicle_controller._lat_controller._offset = offset
 
     def _bypass_target_waypoints(self, waypoint):
         """
@@ -626,7 +719,7 @@ class BehaviorAgent(BasicAgent):
             :return: True if it is safe to keep driving, False if it must brake
         """
         vehicle_list = self._build_obstacle_list(waypoint, max_distance=self.OBSTACLE_MAX_DISTANCE)
-        if self._bypass_state in ('overtaking', 'returning'):
+        if self._bypass_state in ('overtaking', 'returning', 'nudging'):
             vehicle_list = [v for v in vehicle_list
                             if 'static.prop' not in v.type_id and v.id != self._stalled_vehicle_id]
         vehicle_state, vehicle, distance = self._forward_obstacle_detected(vehicle_list)
@@ -642,6 +735,7 @@ class BehaviorAgent(BasicAgent):
         self._bypass_tick_counter = 0
         self._stalled_vehicle_id = None
         self._stalled_tick_counter = 0
+        self._set_lane_offset(0.0)
         self._exit_bypass_caution()
 
     def bypass_obstacle_manager(self, waypoint):
@@ -659,9 +753,15 @@ class BehaviorAgent(BasicAgent):
             obstacle_state, _, _ = self._blocking_obstacle_ahead(waypoint)
             if obstacle_state:
                 self._bypass_origin_waypoint = waypoint
-                self._bypass_state = 'waiting_gap'
                 self._enter_bypass_caution()
-                self._log_bypass_transition('detected', waypoint)
+                offset = self._static_nudge_offset(waypoint)
+                if offset is not None:
+                    self._set_lane_offset(offset)
+                    self._bypass_state = 'nudging'
+                    self._log_bypass_transition('nudging', waypoint)
+                else:
+                    self._bypass_state = 'waiting_gap'
+                    self._log_bypass_transition('detected', waypoint)
             return self._bypass_state != 'idle'
 
         if self._bypass_timed_out():
@@ -669,9 +769,19 @@ class BehaviorAgent(BasicAgent):
             self._reset_bypass_state()
             return False
 
+        if self._bypass_state == 'nudging':
+            if self._obstacle_cleared(waypoint):
+                self._log_bypass_transition('success', waypoint)
+                self._reset_bypass_state()
+                return False
+            return True
+
         if self._bypass_state == 'waiting_gap':
             if self._can_start_bypass(waypoint):
                 if not self._start_bypass_maneuver(waypoint):
+                    # No opposite lane available at this point (edge case
+                    # that used to crash the run) -- abort instead of
+                    # retrying against a target that will never exist.
                     self._log_bypass_transition('aborted', waypoint)
                     self._reset_bypass_state()
                     return False
@@ -682,6 +792,9 @@ class BehaviorAgent(BasicAgent):
         if self._bypass_state == 'overtaking':
             if self._obstacle_cleared(waypoint):
                 if not self._resume_original_lane(waypoint):
+                    # Same edge case as above, at the other end of the
+                    # manoeuvre: nowhere to resume to -- abort rather than
+                    # leave the planner to run dry and freeze in place.
                     self._log_bypass_transition('aborted', waypoint)
                     self._reset_bypass_state()
                     return False
