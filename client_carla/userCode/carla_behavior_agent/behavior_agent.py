@@ -103,6 +103,7 @@ class BehaviorAgent(BasicAgent):
         self._bypass_origin_waypoint = None
         self._bypass_tick_counter = 0
         self._pre_bypass_behavior = None  # saved profile while the Cautious swap is active
+        self._bypass_cluster_span = 0.0  # captured once at detection, see _bypass_progress_clear
 
         self._actors = None
 
@@ -662,6 +663,26 @@ class BehaviorAgent(BasicAgent):
         obstacle_state, _, _ = self._blocking_obstacle_ahead(waypoint)
         return not obstacle_state
 
+    def _bypass_progress_clear(self, waypoint):
+        """
+        Distance-based replacement for `_obstacle_cleared`, used once the
+        agent has actually moved onto the opposite lane ('overtaking' /
+        'returning'). `_blocking_obstacle_ahead` filters candidates by the
+        agent's CURRENT lane, so as soon as the agent steers left it wrongly
+        reports the whole cluster as gone -- well before it is physically
+        behind the agent. Comparing distance travelled since detection
+        against the cluster's span (captured once, see `_static_cluster_span`)
+        is immune to that lane-relative blind spot.
+
+            :param waypoint: the agent's current waypoint
+            :return: True once far enough past the origin to clear the cluster
+        """
+        if self._bypass_origin_waypoint is None:
+            return True
+        travelled = waypoint.transform.location.distance(
+            self._bypass_origin_waypoint.transform.location)
+        return travelled >= self._bypass_cluster_span + self.BYPASS_CLEAR_MARGIN
+
     def _back_on_original_lane(self, waypoint):
         """
         Indicates whether the agent has returned to its original path after taking a detour.
@@ -735,6 +756,7 @@ class BehaviorAgent(BasicAgent):
         self._bypass_tick_counter = 0
         self._stalled_vehicle_id = None
         self._stalled_tick_counter = 0
+        self._bypass_cluster_span = 0.0
         self._set_lane_offset(0.0)
         self._exit_bypass_caution()
 
@@ -753,6 +775,7 @@ class BehaviorAgent(BasicAgent):
             obstacle_state, _, _ = self._blocking_obstacle_ahead(waypoint)
             if obstacle_state:
                 self._bypass_origin_waypoint = waypoint
+                self._bypass_cluster_span = self._static_cluster_span(waypoint)
                 self._enter_bypass_caution()
                 offset = self._static_nudge_offset(waypoint)
                 if offset is not None:
@@ -790,7 +813,7 @@ class BehaviorAgent(BasicAgent):
             return True
 
         if self._bypass_state == 'overtaking':
-            if self._obstacle_cleared(waypoint):
+            if self._bypass_progress_clear(waypoint):
                 if not self._resume_original_lane(waypoint):
                     # Same edge case as above, at the other end of the
                     # manoeuvre: nowhere to resume to -- abort rather than
