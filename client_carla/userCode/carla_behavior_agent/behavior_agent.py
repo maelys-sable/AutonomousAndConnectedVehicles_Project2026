@@ -640,25 +640,49 @@ class BehaviorAgent(BasicAgent):
         """
         self._local_planner._vehicle_controller._lat_controller._offset = offset
 
+    def _forward_on_lane(self, lane_waypoint, same_direction, distance):
+        """
+        Waypoint `distance` metres ahead of `lane_waypoint`, in the EGO
+        VEHICLE's own direction of travel -- not necessarily the lane's
+        own driving direction. On a same-direction lane (`same_direction`
+        True, e.g. the right lane), the lane's forward direction matches
+        ours, so `.next` is correct. On the opposite/oncoming lane used
+        as the last-resort bypass side, the lane's own forward direction
+        is reversed relative to ours: calling `.next` there returns a
+        point BEHIND the ego, which is exactly what made the global route
+        planner send the agent into a reversing manoeuvre while
+        "bypassing" obstacle #3 (see the tick-by-tick log: x started
+        increasing again right after the lane shift). `.previous` on
+        that lane is the one that keeps going the way we're already
+        headed.
+
+            :param lane_waypoint: waypoint on the target lane
+            :param same_direction: True if that lane shares our direction of travel
+            :param distance: distance to look ahead (m)
+            :return: list of waypoints (possibly empty)
+        """
+        return lane_waypoint.next(distance) if same_direction else lane_waypoint.previous(distance)
+
     def _bypass_target_waypoints(self, waypoint):
         """
         Resolves the two waypoints needed to start a bypass: the target
         lane to move into (the right lane if `_bypass_side` allows it,
         otherwise the opposite/left lane as before), and a point on that
-        same lane far enough ahead to clear the whole obstacle cluster
-        (see `_static_cluster_span`), not just the closest prop. Either
-        can legitimately be missing (edge of the map, lane ending) -- this
+        same lane far enough ahead -- in our own direction of travel, see
+        `_forward_on_lane` -- to clear the whole obstacle cluster (see
+        `_static_cluster_span`), not just the closest prop. Either can
+        legitimately be missing (edge of the map, lane ending) -- this
         must be checked before use, not assumed.
 
             :param waypoint: the agent's current waypoint
             :return: tuple (target_wpt, end_waypoint), either may be None
         """
-        target_wpt = (waypoint.get_right_lane() if self._bypass_side(waypoint) == 1
-                      else waypoint.get_left_lane())
+        same_direction = self._bypass_side(waypoint) == 1
+        target_wpt = waypoint.get_right_lane() if same_direction else waypoint.get_left_lane()
         if target_wpt is None:
             return None, None
         reach = self._static_cluster_span(waypoint) + self.BYPASS_CLEAR_MARGIN
-        ahead = target_wpt.next(reach)
+        ahead = self._forward_on_lane(target_wpt, same_direction, reach)
         end_waypoint = ahead[0] if ahead else None
         return target_wpt, end_waypoint
 
