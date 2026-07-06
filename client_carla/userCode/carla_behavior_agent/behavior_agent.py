@@ -544,14 +544,24 @@ class BehaviorAgent(BasicAgent):
     def _bypass_forward_clear(self, waypoint):
         """
         Checks for a vehicle immediately ahead in the lane currently used
-        during the manoeuvre (the obstacle itself, or another vehicle
-        merging back into). Without this check the bypass branch of
-        `run_step` would drive blindly at `_bypass_target_speed`.
+        during the manoeuvre (another vehicle merging into it, for
+        instance). While actively going around the obstacle ('overtaking'/
+        'returning'), the static prop(s) or stalled vehicle being bypassed
+        are excluded: they are already handled by the bypass state machine
+        itself (`_obstacle_cleared`), and re-checking them here caused the
+        agent to brake to a stop right against the very obstacle it was
+        going around, then never move again (nothing left to make the
+        obstacle disappear from view). Before that ('idle'/'waiting_gap'),
+        no exclusion applies, so the agent still slows down and stops
+        approaching the obstacle while it waits for a safe gap.
 
             :param waypoint: the agent's current waypoint
             :return: True if it is safe to keep driving, False if it must brake
         """
         vehicle_list = self._build_obstacle_list(waypoint, max_distance=self.OBSTACLE_MAX_DISTANCE)
+        if self._bypass_state in ('overtaking', 'returning'):
+            vehicle_list = [v for v in vehicle_list
+                            if 'static.prop' not in v.type_id and v.id != self._stalled_vehicle_id]
         vehicle_state, vehicle, distance = self._forward_obstacle_detected(vehicle_list)
         if not vehicle_state:
             return True
