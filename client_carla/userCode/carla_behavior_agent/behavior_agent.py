@@ -880,6 +880,27 @@ class BehaviorAgent(BasicAgent):
         margin = max(vehicle.bounding_box.extent.x, vehicle.bounding_box.extent.y)
         return (distance - margin) >= self.BYPASS_FORWARD_MARGIN
 
+    def _fallback_to_full_bypass(self, waypoint):
+        """
+        Abandons an in-lane nudge in favour of a full lane-level bypass.
+
+        Clears the in-lane offset applied while nudging -- left in place,
+        it lingers as a stale lateral bias once `_start_bypass_maneuver`
+        sets a destination on the opposite lane: the new trajectory
+        already accounts for the full lane shift, so adding the old
+        nudge offset on top of it either widens or narrows the actual
+        clearance unpredictably. This is what let the agent still clip a
+        static.prop.trafficwarning that needed more room than an in-lane
+        nudge could give: `_bypass_refresh_nudge` correctly detected the
+        obstacle no longer fit an in-lane offset, but the offset itself
+        was never cancelled before switching to the full bypass path.
+
+            :param waypoint: the agent's current waypoint
+        """
+        self._set_lane_offset(0.0)
+        self._bypass_state = 'waiting_gap'
+        self._log_bypass_transition('detected', waypoint)
+
     def _reset_bypass_state(self):
         """Resets the status of the bypass module."""
         self._bypass_state = 'idle'
@@ -935,9 +956,8 @@ class BehaviorAgent(BasicAgent):
                 # The obstacle set ahead no longer fits an in-lane nudge
                 # (e.g. a new prop further down the scene needs more
                 # clearance than the lane allows) -- fall back to a full
-                # lane-level bypass instead of coasting on a stale offset.
-                self._bypass_state = 'waiting_gap'
-                self._log_bypass_transition('detected', waypoint)
+                # lane-level bypass.
+                self._fallback_to_full_bypass(waypoint)
             return True
 
         if self._bypass_state == 'waiting_gap':
