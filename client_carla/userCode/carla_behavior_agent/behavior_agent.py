@@ -104,6 +104,7 @@ class BehaviorAgent(BasicAgent):
         self._bypass_tick_counter = 0
         self._pre_bypass_behavior = None  # saved profile while the Cautious swap is active
         self._bypass_cluster_span = 0.0  # captured once at detection, see _bypass_progress_clear
+        self._bypass_cluster_ids = frozenset()  # ids to ignore in _bypass_forward_clear, see below
 
         self._actors = None
 
@@ -345,6 +346,19 @@ class BehaviorAgent(BasicAgent):
 
 #----------------------------------------------------------------------------------------------#
 
+    def _bypass_range_obstacle_detected(self, obstacle_list):
+        """
+        Shared `_vehicle_obstacle_detected` call used by both
+        `_static_obstacle_ahead` and `_stalled_vehicle_ahead` -- the two
+        only ever differed by which list they passed in, not by any of
+        the detection parameters.
+
+            :param obstacle_list: candidates to check (static props or vehicles)
+            :return: tuple (obstacle_state, obstacle, distance)
+        """
+        return self._vehicle_obstacle_detected(
+            obstacle_list, self.BYPASS_DETECTION_DISTANCE, up_angle_th=self.FORWARD_ANGLE_STRAIGHT)
+
     def _static_obstacle_ahead(self, waypoint):
         """
         Detects a static obstacle (roadworks, accident, parked vehicle)
@@ -355,8 +369,7 @@ class BehaviorAgent(BasicAgent):
         """
         obstacle_list = self._build_obstacle_list(waypoint, max_distance=self.BYPASS_DETECTION_DISTANCE)
         static_list = [o for o in obstacle_list if "static.prop" in o.type_id]
-        return self._vehicle_obstacle_detected(
-            static_list, self.BYPASS_DETECTION_DISTANCE, up_angle_th=self.FORWARD_ANGLE_STRAIGHT)
+        return self._bypass_range_obstacle_detected(static_list)
 
     def _update_stall_tracking(self, vehicle):
         """
@@ -395,8 +408,7 @@ class BehaviorAgent(BasicAgent):
             :return: tuple (obstacle_state, obstacle, distance)
         """
         obstacle_list = self._build_obstacle_list(waypoint, max_distance=self.BYPASS_DETECTION_DISTANCE)
-        vehicle_state, vehicle, distance = self._vehicle_obstacle_detected(
-            obstacle_list, self.BYPASS_DETECTION_DISTANCE, up_angle_th=self.FORWARD_ANGLE_STRAIGHT)
+        vehicle_state, vehicle, distance = self._bypass_range_obstacle_detected(obstacle_list)
 
         self._update_stall_tracking(vehicle if vehicle_state else None)
         if vehicle_state and self._stalled_vehicle_confirmed():
@@ -848,13 +860,19 @@ class BehaviorAgent(BasicAgent):
         Checks for a vehicle immediately ahead in the lane currently used
         during the manoeuvre (another vehicle merging into it, for
         instance). While actively going around the obstacle ('overtaking'/
-        'returning'), the static prop(s) or stalled vehicle being bypassed
-        are excluded: they are already handled by the bypass state machine
-        itself (`_obstacle_cleared`), and re-checking them here caused the
-        agent to brake to a stop right against the very obstacle it was
-        going around, then never move again (nothing left to make the
-        obstacle disappear from view). Before that ('idle'/'waiting_gap'),
-        no exclusion applies, so the agent still slows down and stops
+        'returning'/'nudging'), only the specific obstacle(s) captured in
+        `_bypass_cluster_ids` at detection time (plus a confirmed stalled
+        vehicle) are excluded -- they are already handled by the bypass
+        state machine itself (`_obstacle_cleared`), and re-checking them
+        here caused the agent to brake to a stop right against the very
+        obstacle it was going around. This used to exclude every
+        static.prop by TYPE instead of by id: whenever the tracked cluster
+        legitimately spanned a long stretch (see `_static_cluster_span`),
+        that blanket exclusion made the agent blind to any *other* static
+        prop appearing anywhere in that stretch too -- which is what let
+        it drive straight into a static.prop.trafficwarning it was never
+        actually bypassing. Before detection ('idle'/'waiting_gap'), no
+        exclusion applies at all, so the agent still slows down and stops
         approaching the obstacle while it waits for a safe gap.
 
             :param waypoint: the agent's current waypoint
@@ -862,8 +880,8 @@ class BehaviorAgent(BasicAgent):
         """
         vehicle_list = self._build_obstacle_list(waypoint, max_distance=self.OBSTACLE_MAX_DISTANCE)
         if self._bypass_state in ('overtaking', 'returning', 'nudging'):
-            vehicle_list = [v for v in vehicle_list
-                            if 'static.prop' not in v.type_id and v.id != self._stalled_vehicle_id]
+            ignored_ids = self._bypass_cluster_ids | {self._stalled_vehicle_id}
+            vehicle_list = [v for v in vehicle_list if v.id not in ignored_ids]
         vehicle_state, vehicle, distance = self._forward_obstacle_detected(vehicle_list)
         if not vehicle_state:
             return True
@@ -878,6 +896,7 @@ class BehaviorAgent(BasicAgent):
         self._stalled_vehicle_id = None
         self._stalled_tick_counter = 0
         self._bypass_cluster_span = 0.0
+        self._bypass_cluster_ids = frozenset()
         self._set_lane_offset(0.0)
         self._exit_bypass_caution()
 
@@ -897,6 +916,8 @@ class BehaviorAgent(BasicAgent):
             if obstacle_state:
                 self._bypass_origin_waypoint = waypoint
                 self._bypass_cluster_span = self._static_cluster_span(waypoint)
+                self._bypass_cluster_ids = frozenset(
+                    o.id for o in self._static_cluster_members(waypoint))
                 self._enter_bypass_caution()
                 offset = self._static_nudge_offset(waypoint)
                 if offset is not None:
