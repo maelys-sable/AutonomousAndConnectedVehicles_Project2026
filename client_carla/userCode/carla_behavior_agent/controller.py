@@ -227,7 +227,29 @@ class StanleyLateralController():
                     self._wps[i][0].transform.location.y - self._wps[i-1][0].transform.location.y]))
             lookahead_idx = i
         return lookahead_idx
-    
+
+    def _offset_target_point(self, ce_idx):
+        """
+        Position (x, y) of the target waypoint, displaced sideways by
+        `self._offset` (m) along that waypoint's right vector -- same
+        convention as PIDLateralController._pid_control (positive =
+        right). Without this, `_stanley_control` read the waypoint's raw
+        centre-line location and `self._offset` was stored but never
+        used, so the crosstrack error was always computed against the
+        lane centre: the vehicle kept aiming at whatever obstacle sat on
+        that centreline regardless of the offset set by the bypass
+        manoeuvre in behavior_agent.py.
+
+            :param ce_idx: index of the target waypoint in self._wps
+            :return: (x, y) of the point the Stanley law should aim at
+        """
+        target_wp = self._wps[ce_idx][0]
+        loc = target_wp.transform.location
+        if self._offset == 0:
+            return loc.x, loc.y
+        right = target_wp.transform.get_right_vector()
+        return loc.x + self._offset * right.x, loc.y + self._offset * right.y
+
     def _stanley_control(self, vehicle_transform):
         """
         Estimate the steering angle of the vehicle based on the Stanley equations
@@ -244,8 +266,7 @@ class StanleyLateralController():
         
         # Get Target Waypoint
         ce_idx = self._get_lookahead_index(ego_loc,self._lookahead_distance)
-        desired_x = self._wps[ce_idx][0].transform.location.x
-        desired_y = self._wps[ce_idx][0].transform.location.y
+        desired_x, desired_y = self._offset_target_point(ce_idx)
         
         # Get Target Heading
         if ce_idx < len(self._wps)-1:
