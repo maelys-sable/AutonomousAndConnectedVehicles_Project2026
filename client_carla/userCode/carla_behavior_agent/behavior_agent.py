@@ -521,20 +521,45 @@ class BehaviorAgent(BasicAgent):
             return True
         return self._gap_is_safe(oncoming_distance, get_speed(oncoming_vehicle))
 
+    def _is_ahead_of_vehicle(self, waypoint, obstacle):
+        """
+        True if `obstacle` lies ahead of the agent's current heading
+        rather than behind it. `_static_cluster_members` used to sort
+        candidates by raw (unsigned) distance only, so a prop just
+        cleared -- very close, but now behind -- could anchor the
+        cluster-gap chain and mask a real obstacle further ahead (e.g. a
+        warning sign ~30-40m downstream, past BYPASS_CLUSTER_GAP from the
+        already-passed prop). That is what let the nudge offset stay
+        frozen for the first prop only and collide with the second
+        (static.prop.trafficwarning).
+
+            :param waypoint: the agent's current waypoint
+            :param obstacle: candidate static prop / vehicle
+            :return: True if the obstacle is in front of the agent
+        """
+        forward = waypoint.transform.get_forward_vector()
+        wp_loc = waypoint.transform.location
+        obs_loc = obstacle.get_location()
+        dx, dy = obs_loc.x - wp_loc.x, obs_loc.y - wp_loc.y
+        return dx * forward.x + dy * forward.y > 0
+
     def _static_cluster_members(self, waypoint):
         """
         Static obstacles that form a single contiguous group ahead: two
         obstacles more than BYPASS_CLUSTER_GAP apart are treated as
         separate events. A roadwork/accident scene is frequently made of
         several close-together props (cone, debris, warning sign) rather
-        than a single one.
+        than a single one. Obstacles behind the agent are excluded first
+        (see `_is_ahead_of_vehicle`) so a just-passed prop can't anchor
+        the gap chain and shadow the next one still ahead.
 
             :param waypoint: the agent's current waypoint
             :return: list of obstacles in the cluster, nearest first
         """
         obstacle_list = self._build_obstacle_list(waypoint, max_distance=self.BYPASS_DETECTION_DISTANCE)
         static_list = sorted(
-            (o for o in obstacle_list if 'static.prop' in o.type_id),
+            (o for o in obstacle_list
+             if 'static.prop' in o.type_id and self._is_ahead_of_vehicle(waypoint, o)),
             key=lambda o: o.get_location().distance(waypoint.transform.location))
 
         cluster = []
@@ -639,6 +664,26 @@ class BehaviorAgent(BasicAgent):
             :param offset: signed lateral offset in metres (0 to cancel)
         """
         self._local_planner._vehicle_controller._lat_controller._offset = offset
+
+    def _bypass_refresh_nudge(self, waypoint):
+        """
+        Recomputes the in-lane nudge offset every tick while nudging,
+        instead of freezing the value captured once at detection time. A
+        roadwork/accident scene can have props spaced further apart than
+        BYPASS_CLUSTER_GAP (e.g. a cone near the start, a warning sign
+        much further along): the offset sized for the first-seen member
+        alone left later ones uncleared, which is what caused a collision
+        with a static.prop.trafficwarning further into the scene.
+
+            :param waypoint: the agent's current waypoint
+            :return: True if a valid offset was applied, False if the
+                     current obstacle set no longer fits an in-lane nudge
+        """
+        offset = self._static_nudge_offset(waypoint)
+        if offset is None:
+            return False
+        self._set_lane_offset(offset)
+        return True
 
     def _forward_on_lane(self, lane_waypoint, same_direction, distance):
         """
@@ -873,6 +918,13 @@ class BehaviorAgent(BasicAgent):
                 self._log_bypass_transition('success', waypoint)
                 self._reset_bypass_state()
                 return False
+            if not self._bypass_refresh_nudge(waypoint):
+                # The obstacle set ahead no longer fits an in-lane nudge
+                # (e.g. a new prop further down the scene needs more
+                # clearance than the lane allows) -- fall back to a full
+                # lane-level bypass instead of coasting on a stale offset.
+                self._bypass_state = 'waiting_gap'
+                self._log_bypass_transition('detected', waypoint)
             return True
 
         if self._bypass_state == 'waiting_gap':
