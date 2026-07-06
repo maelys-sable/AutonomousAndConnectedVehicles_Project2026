@@ -36,6 +36,8 @@ class BehaviorAgent(BasicAgent):
 
     BYPASS_DETECTION_DISTANCE = 80
     BYPASS_MIN_GAP_TIME = 4.0
+    BYPASS_MANEUVER_SPEED = 25      # km/h cap while alongside the obstacle (props/parked vehicles are close)
+    BYPASS_FORWARD_MARGIN = 8       # m, extra stopping margin kept ahead during the manoeuvre
 
     STATE_LOG_INTERVAL = 20
     BYPASS_TIMEOUT_TICKS = 800
@@ -95,6 +97,7 @@ class BehaviorAgent(BasicAgent):
         self._bypass_state = 'idle'
         self._bypass_origin_waypoint = None
         self._bypass_tick_counter = 0
+        self._pre_bypass_behavior = None  # saved profile while the Cautious swap is active
 
         self._actors = None
 
@@ -154,11 +157,12 @@ class BehaviorAgent(BasicAgent):
             'success': f"[BYPASS] TEST SUCCESSFUL: obstacle bypassed, back on track{pos}",
             'timeout': f"[BYPASS] TEST FAILED: manoeuvre timed out{pos}"
                        f"(stuck in '{self._bypass_state}')",
+            'aborted': f"[BYPASS] TEST FAILED: no usable opposite lane{pos} -> aborting manoeuvre",
         }
         print(messages[event])
         if event == 'success':
             self._scenario_result = True
-        elif event == 'timeout':
+        elif event in ('timeout', 'aborted'):
             self._scenario_result = False
 
     def _bypass_timed_out(self):
@@ -460,16 +464,32 @@ class BehaviorAgent(BasicAgent):
             return True
         return self._gap_is_safe(oncoming_distance, get_speed(oncoming_vehicle))
 
+    def _bypass_target_waypoints(self, waypoint):
+        """
+        Resolves the two waypoints needed to start a bypass: the opposite
+        lane to move into, and the current local-planner target to resume
+        towards afterwards. Either can legitimately be missing (edge of the
+        map, lane ending, planner between targets) -- this must be checked
+        before use, not assumed.
+
+            :param waypoint: the agent's current waypoint
+            :return: tuple (opposite_wpt, end_waypoint), either may be None
+        """
+        return waypoint.get_left_lane(), self._local_planner.target_waypoint
+
     def _start_bypass_maneuver(self, waypoint):
         """
         Triggers a lateral shift to the opposite lane to bypass the obstacle 
         (same mechanism as `_tailgating`: redefine the local destination to the adjacent lane).
 
             :param waypoint: the agent’s current waypoint
+            :return: True if the manoeuvre was actually started
         """
-        opposite_wpt = waypoint.get_left_lane()
-        end_waypoint = self._local_planner.target_waypoint
+        opposite_wpt, end_waypoint = self._bypass_target_waypoints(waypoint)
+        if opposite_wpt is None or end_waypoint is None:
+            return False
         self.set_destination(end_waypoint.transform.location, opposite_wpt.transform.location)
+        return True
 
     def _obstacle_cleared(self, waypoint):
         """
@@ -492,6 +512,52 @@ class BehaviorAgent(BasicAgent):
         return (self._bypass_origin_waypoint is not None
                 and waypoint.lane_id == self._bypass_origin_waypoint.lane_id)
 
+    def _enter_bypass_caution(self):
+        """
+        Switches the active behavior profile to Cautious for the duration of
+        the manoeuvre (larger min_proximity_threshold and braking_distance),
+        since a bypass happens right next to the obstacle being avoided.
+        No-op if already Cautious (e.g. the agent was configured that way).
+        """
+        if not isinstance(self._behavior, Cautious):
+            self._pre_bypass_behavior = self._behavior
+            self._behavior = Cautious()
+            print("[BYPASS] Switching to Cautious profile for the manoeuvre")
+
+    def _exit_bypass_caution(self):
+        """Restores the behavior profile saved by `_enter_bypass_caution`."""
+        if self._pre_bypass_behavior is not None:
+            self._behavior = self._pre_bypass_behavior
+            self._pre_bypass_behavior = None
+            print("[BYPASS] Restoring previous behavior profile")
+
+    def _bypass_target_speed(self):
+        """
+        Conservative cruise speed while alongside the obstacle: static props
+        and parked/stalled vehicles leave little lateral margin, so the
+        manoeuvre is capped well below the profile's usual max_speed.
+
+            :return: target speed in km/h
+        """
+        return min(self.BYPASS_MANEUVER_SPEED, self._speed_limit - self._behavior.speed_lim_dist)
+
+    def _bypass_forward_clear(self, waypoint):
+        """
+        Checks for a vehicle immediately ahead in the lane currently used
+        during the manoeuvre (the obstacle itself, or another vehicle
+        merging back into). Without this check the bypass branch of
+        `run_step` would drive blindly at `_bypass_target_speed`.
+
+            :param waypoint: the agent's current waypoint
+            :return: True if it is safe to keep driving, False if it must brake
+        """
+        vehicle_list = self._build_obstacle_list(waypoint, max_distance=self.OBSTACLE_MAX_DISTANCE)
+        vehicle_state, vehicle, distance = self._forward_obstacle_detected(vehicle_list)
+        if not vehicle_state:
+            return True
+        margin = max(vehicle.bounding_box.extent.x, vehicle.bounding_box.extent.y)
+        return (distance - margin) >= self.BYPASS_FORWARD_MARGIN
+
     def _reset_bypass_state(self):
         """Resets the status of the bypass module."""
         self._bypass_state = 'idle'
@@ -499,6 +565,7 @@ class BehaviorAgent(BasicAgent):
         self._bypass_tick_counter = 0
         self._stalled_vehicle_id = None
         self._stalled_tick_counter = 0
+        self._exit_bypass_caution()
 
     def bypass_obstacle_manager(self, waypoint):
         """
@@ -516,6 +583,7 @@ class BehaviorAgent(BasicAgent):
             if obstacle_state:
                 self._bypass_origin_waypoint = waypoint
                 self._bypass_state = 'waiting_gap'
+                self._enter_bypass_caution()
                 self._log_bypass_transition('detected', waypoint)
             return self._bypass_state != 'idle'
 
@@ -526,7 +594,10 @@ class BehaviorAgent(BasicAgent):
 
         if self._bypass_state == 'waiting_gap':
             if self._can_start_bypass(waypoint):
-                self._start_bypass_maneuver(waypoint)
+                if not self._start_bypass_maneuver(waypoint):
+                    self._log_bypass_transition('aborted', waypoint)
+                    self._reset_bypass_state()
+                    return False
                 self._bypass_state = 'overtaking'
                 self._log_bypass_transition('gap_found', waypoint)
             return True
@@ -772,6 +843,23 @@ class BehaviorAgent(BasicAgent):
 
 #----------------------------------------------------------------------------------------------#
 
+    def _bypass_drive_control(self, waypoint, debug=False):
+        """
+        Driving control while a bypass manoeuvre is in progress. Replaces a
+        blind "drive at max_speed" with a capped speed and a forward check,
+        since the previous version skipped collision avoidance entirely
+        while alongside the obstacle (root cause of colliding with static
+        props and with a vehicle straight ahead during the manoeuvre).
+
+            :param waypoint: the agent's current waypoint
+            :param debug: boolean for debugging
+            :return control: carla.VehicleControl
+        """
+        if not self._bypass_forward_clear(waypoint):
+            return self.emergency_stop()
+        self._local_planner.set_speed(self._bypass_target_speed())
+        return self._local_planner.run_step(debug=debug)
+
     def car_following_manager(self, vehicle, distance, debug=False):
         """
         Module in charge of car-following behaviors when there's
@@ -862,11 +950,7 @@ class BehaviorAgent(BasicAgent):
 
         # 2.2: Static obstacle bypass behavior (construction/accident/parked vehicle)
         if self.bypass_obstacle_manager(ego_vehicle_wp):
-            target_speed = min([
-                self._behavior.max_speed,
-                self._speed_limit - self._behavior.speed_lim_dist])
-            self._local_planner.set_speed(target_speed)
-            return self._local_planner.run_step(debug=debug)
+            return self._bypass_drive_control(ego_vehicle_wp, debug=debug)
 
         # 2.3: Car following behaviors
         vehicle_state, vehicle, distance = self.collision_and_car_avoid_manager(ego_vehicle_wp)
