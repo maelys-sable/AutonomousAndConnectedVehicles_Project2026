@@ -458,14 +458,64 @@ class BehaviorAgent(BasicAgent):
         time_to_arrival = oncoming_distance / speed_ms
         return time_to_arrival >= min_gap_time
 
+    def _right_lane_usable(self, waypoint):
+        """
+        Right-hand lane candidate for a bypass that stays on the correct
+        side of the road, i.e. a same-direction driving lane -- as opposed
+        to the opposite (oncoming) lane used as a fallback. Prefer this
+        side whenever possible: it never requires a gap in oncoming
+        traffic, unlike a bypass via the left lane.
+
+            :param waypoint: the agent's current waypoint
+            :return: the right-lane waypoint if it qualifies, else None
+        """
+        right_wpt = waypoint.get_right_lane()
+        if right_wpt is None or right_wpt.lane_type != carla.LaneType.Driving:
+            return None
+        if waypoint.lane_id * right_wpt.lane_id <= 0:
+            return None  # sign flip -> that "right lane" is oncoming traffic
+        return right_wpt
+
+    def _right_lane_clear(self, waypoint):
+        """
+        Checks whether the right-hand lane is free over the bypass
+        detection range, so it can actually be used as an overtaking path.
+
+            :param waypoint: the agent's current waypoint
+            :return: True if no obstacle occupies the right lane
+        """
+        vehicle_list = self._build_obstacle_list(waypoint, max_distance=self.BYPASS_DETECTION_DISTANCE)
+        state, _, _ = self._vehicle_obstacle_detected(
+            vehicle_list, self.BYPASS_DETECTION_DISTANCE, up_angle_th=180, lane_offset=1)
+        return not state
+
+    def _bypass_side(self, waypoint):
+        """
+        Picks which side a full lane-level bypass should use: the right
+        lane whenever it exists, is a same-direction lane, and is clear
+        (no oncoming-traffic risk), falling back to the opposite (left)
+        lane otherwise -- the only option on a plain two-way road.
+
+            :param waypoint: the agent's current waypoint
+            :return: 1 to bypass via the right lane, -1 via the left lane
+        """
+        if self._right_lane_usable(waypoint) is not None and self._right_lane_clear(waypoint):
+            return 1
+        return -1
+
     def _can_start_bypass(self, waypoint):
         """
-        Determines whether the agent can move onto the opposite lane to
-        go round the detected obstacle (if the lane is clear or there is sufficient space).
+        Determines whether the agent can move onto the chosen lane to go
+        round the detected obstacle. A right-lane bypass (see
+        `_bypass_side`) needs no oncoming-traffic check: it's already
+        confirmed clear by `_right_lane_clear`. Otherwise, the left/
+        opposite lane requires a safe gap in oncoming traffic.
 
             :param waypoint: the agent’s current waypoint
             :return: True if the manoeuvre can begin
         """
+        if self._bypass_side(waypoint) == 1:
+            return True
         oncoming_state, oncoming_vehicle, oncoming_distance = self._oncoming_lane_obstacle(waypoint)
         if not oncoming_state:
             return True
@@ -592,34 +642,36 @@ class BehaviorAgent(BasicAgent):
 
     def _bypass_target_waypoints(self, waypoint):
         """
-        Resolves the two waypoints needed to start a bypass: the opposite
-        lane to move into, and a point on that same opposite lane far
-        enough ahead to clear the whole obstacle cluster (see
-        `_static_cluster_span`), not just the closest prop. Either can
-        legitimately be missing (edge of the map, lane ending) -- this must
-        be checked before use, not assumed.
+        Resolves the two waypoints needed to start a bypass: the target
+        lane to move into (the right lane if `_bypass_side` allows it,
+        otherwise the opposite/left lane as before), and a point on that
+        same lane far enough ahead to clear the whole obstacle cluster
+        (see `_static_cluster_span`), not just the closest prop. Either
+        can legitimately be missing (edge of the map, lane ending) -- this
+        must be checked before use, not assumed.
 
             :param waypoint: the agent's current waypoint
-            :return: tuple (opposite_wpt, end_waypoint), either may be None
+            :return: tuple (target_wpt, end_waypoint), either may be None
         """
-        opposite_wpt = waypoint.get_left_lane()
-        if opposite_wpt is None:
+        target_wpt = (waypoint.get_right_lane() if self._bypass_side(waypoint) == 1
+                      else waypoint.get_left_lane())
+        if target_wpt is None:
             return None, None
         reach = self._static_cluster_span(waypoint) + self.BYPASS_CLEAR_MARGIN
-        ahead = opposite_wpt.next(reach)
+        ahead = target_wpt.next(reach)
         end_waypoint = ahead[0] if ahead else None
-        return opposite_wpt, end_waypoint
+        return target_wpt, end_waypoint
 
     def _start_bypass_maneuver(self, waypoint):
         """
-        Triggers a lateral shift to the opposite lane to bypass the obstacle
-        cluster. Calls `set_destination` with a single argument (the
-        opposite-lane point past the whole cluster): passing a
-        `start_location` there is not reliable -- this agent's
+        Triggers a lateral shift to the target lane (see `_bypass_side`)
+        to bypass the obstacle cluster. Calls `set_destination` with a
+        single argument (the target-lane point past the whole cluster):
+        passing a `start_location` there is not reliable -- this agent's
         `set_destination` silently substitutes the vehicle's current
         location for it and appends to the existing plan instead of
         replacing it, so the shift never actually happened. With a single
-        end location on the opposite lane, the global route planner is
+        end location on the target lane, the global route planner is
         forced to compute a genuine lane change to reach it.
 
             :param waypoint: the agent's current waypoint
