@@ -66,7 +66,7 @@ class BehaviorAgent(BasicAgent):
     #     gap acceptance : _can_start_bypass, _bypass_side,              #
     #                      _right_lane_usable, _right_lane_clear,        #
     #                      _oncoming_lane_obstacle, _vehicles_on_lane,   #
-    #                      _gap_is_safe                                 #
+    #                      _gap_is_safe, _required_bypass_gap_time       #
     #     manoeuvre      : _start_bypass_maneuver, _build_lane_shift_path, #
     #                      _bypass_remaining_distance, _forward_on_lane,   #
     #                      _resume_original_lane, _overtaking_transition_  #
@@ -131,7 +131,7 @@ class BehaviorAgent(BasicAgent):
 
     STATE_LOG_INTERVAL = 20
     BYPASS_TIMEOUT_TICKS = 800
-    BYPASS_DEBUG = True   # opt-in: prints bypass_diagnostics every tick a
+    BYPASS_DEBUG = False   # opt-in: prints bypass_diagnostics every tick a
                           # manoeuvre is active (see log_bypass_diagnostics),
                           # instead of adding print statements by hand each
                           # time the raw numbers behind a decision are needed.
@@ -651,13 +651,48 @@ class BehaviorAgent(BasicAgent):
             return 1
         return -1
 
+    def _required_bypass_gap_time(self, waypoint):
+        """
+        Minimum time-to-arrival required from an oncoming vehicle before
+        starting a full lane-level bypass, scaled to how long the
+        manoeuvre will actually take -- not a flat `BYPASS_MIN_GAP_TIME`
+        regardless of how far the agent must travel on the opposite lane.
+
+        `BYPASS_MIN_GAP_TIME` alone answers "will the oncoming vehicle
+        arrive in the next 4 seconds?", which says nothing about second 5
+        through the end of the crossing. For a short obstacle (a single
+        cone, a few metres) 4 s covers the whole manoeuvre and is fine.
+        For a long one (a full construction zone spanning most of the
+        lane, tens of metres), the crossing itself can take 10+ seconds
+        at manoeuvre speed -- a gap only checked to be safe for the first
+        4 is exactly the blind spot that let an oncoming vehicle arrive
+        mid-crossing (see the diagnostics logged before this fix: a
+        34.6 m cluster, oncoming traffic at 79.8 km/h).
+
+        Uses `BYPASS_MIN_MANEUVER_SPEED` (the manoeuvre's slowest speed,
+        not its cruise speed) as the worst-case crossing speed, so the
+        estimate doesn't undershoot the real crossing time. Never goes
+        below `BYPASS_MIN_GAP_TIME` itself, which is kept as the extra
+        buffer added on top (covering reaction time and the return leg,
+        not modelled separately here to keep this simple).
+
+            :param waypoint: the agent's current waypoint
+            :return: required gap time in seconds
+        """
+        distance = self._bypass_remaining_distance(waypoint)
+        crossing_speed_ms = self.BYPASS_MIN_MANEUVER_SPEED / 3.6
+        crossing_time = distance / crossing_speed_ms
+        return max(self.BYPASS_MIN_GAP_TIME, crossing_time + self.BYPASS_MIN_GAP_TIME)
+
     def _can_start_bypass(self, waypoint):
         """
         Determines whether the agent can move onto the chosen lane to go
         round the detected obstacle. A right-lane bypass (see
         `_bypass_side`) needs no oncoming-traffic check: it's already
         confirmed clear by `_right_lane_clear`. Otherwise, the left/
-        opposite lane requires a safe gap in oncoming traffic.
+        opposite lane requires a gap in oncoming traffic sized to how
+        long the crossing will actually take (see
+        `_required_bypass_gap_time`), not a flat minimum.
 
             :param waypoint: the agent’s current waypoint
             :return: True if the manoeuvre can begin
@@ -667,7 +702,9 @@ class BehaviorAgent(BasicAgent):
         oncoming_state, oncoming_vehicle, oncoming_distance = self._oncoming_lane_obstacle(waypoint)
         if not oncoming_state:
             return True
-        return self._gap_is_safe(oncoming_distance, get_speed(oncoming_vehicle))
+        return self._gap_is_safe(
+            oncoming_distance, get_speed(oncoming_vehicle),
+            min_gap_time=self._required_bypass_gap_time(waypoint))
 
     def _is_ahead_of_vehicle(self, waypoint, obstacle):
         """
