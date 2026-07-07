@@ -152,6 +152,12 @@ class PIDLongitudinalController():
         """
 
         error = target_speed - current_speed
+        if self._error_buffer:
+            previous_error = self._error_buffer[-1]
+            crossed_target = (previous_error > 0 and error <= 0) or (previous_error < 0 and error >= 0)
+            if crossed_target:
+                self._error_buffer.clear()
+
         self._error_buffer.append(error)
 
         if len(self._error_buffer) >= 2:

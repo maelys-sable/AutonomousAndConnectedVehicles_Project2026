@@ -45,6 +45,8 @@ class BehaviorAgent(BasicAgent):
     DETECTION_SPEED_MARGIN_SECONDS = 2.5   # extra forward detection range, in seconds of travel
     BRAKING_SPEED_MARGIN_SECONDS = 0.8     # extra emergency-stop trigger distance, in seconds of travel
 
+    LATERAL_HAZARD_HALF_WIDTH = 3.0   # m either side of the lane centerline still considered a hazard
+
     BYPASS_DETECTION_DISTANCE = 80
     BYPASS_MIN_GAP_TIME = 4.0
 
@@ -324,6 +326,55 @@ class BehaviorAgent(BasicAgent):
                    self._speed_limit / 3)
         return self._dynamic_forward_distance(base)
 
+    def _road_projection(self, actor, waypoint):
+        """
+        Projects `actor` onto the road's own local frame at `waypoint`:
+        longitudinal distance ahead along the road heading, and signed
+        lateral distance from its centerline. Computed directly from the
+        road's heading vector rather than from lane_id, so it works even
+        for an actor whose current waypoint isn't (yet) snapped onto the
+        driving lane - see `LATERAL_HAZARD_HALF_WIDTH`.
+
+            :param actor: the candidate obstacle
+            :param waypoint: the agent's current waypoint
+            :return: (longitudinal, lateral) in meters
+        """
+        yaw = math.radians(waypoint.transform.rotation.yaw)
+        forward = (math.cos(yaw), math.sin(yaw))
+        right = (-math.sin(yaw), math.cos(yaw))
+        loc = actor.get_location()
+        origin = waypoint.transform.location
+        dx, dy = loc.x - origin.x, loc.y - origin.y
+        longitudinal = dx * forward[0] + dy * forward[1]
+        lateral = dx * right[0] + dy * right[1]
+        return longitudinal, lateral
+
+    def _lateral_hazard_ahead(self, waypoint):
+        """
+        Direct geometric scan for something approaching the road from the
+        side (a cyclist still on the shoulder, a crossing object) within
+        the same dynamic range as the forward scan, independent of
+        lane_id matching (see the class-level note on
+        `LATERAL_HAZARD_HALF_WIDTH`).
+
+            :param waypoint: the agent's current waypoint
+            :return: tuple (hazard_state, actor, longitudinal_distance)
+        """
+        obstacle_list = self._build_obstacle_list(waypoint, max_distance=self._collision_detection_range())
+        closest = None
+        closest_distance = None
+        for actor in obstacle_list:
+            longitudinal, lateral = self._road_projection(actor, waypoint)
+            if longitudinal <= 0:
+                continue  # behind the agent
+            if abs(lateral) > self.LATERAL_HAZARD_HALF_WIDTH:
+                continue  # too far to the side to be a real hazard
+            if closest_distance is None or longitudinal < closest_distance:
+                closest, closest_distance = actor, longitudinal
+        if closest is None:
+            return False, None, -1
+        return True, closest, closest_distance
+
     def _forward_detection_angle(self):
         """
         Frontal detection angle to be used: widened when cornering to detect
@@ -380,6 +431,10 @@ class BehaviorAgent(BasicAgent):
             vehicle_state, vehicle, distance = self._lane_change_obstacle_detected(vehicle_list, lane_offset=1)
         else:
             vehicle_state, vehicle, distance = self._forward_obstacle_detected(vehicle_list)
+
+            lateral_state, lateral_actor, lateral_distance = self._lateral_hazard_ahead(waypoint)
+            if lateral_state and (not vehicle_state or lateral_distance < distance):
+                vehicle_state, vehicle, distance = lateral_state, lateral_actor, lateral_distance
 
             # Check for tailgating
             if not vehicle_state and self._direction == RoadOption.LANEFOLLOW \
@@ -759,17 +814,16 @@ class BehaviorAgent(BasicAgent):
 
         walker_list = self._actors.filter("*walker.pedestrian*")
         def dist(w): return w.get_location().distance(waypoint.transform.location)
-        walker_list = [w for w in walker_list if dist(w) < 10]
+        walker_list = [w for w in walker_list if dist(w) < self._collision_detection_range()]
 
         if self._direction == RoadOption.CHANGELANELEFT:
-            walker_state, walker, distance = self._vehicle_obstacle_detected(walker_list, max(
-                self._behavior.min_proximity_threshold, self._speed_limit / 2), up_angle_th=90, lane_offset=-1)
+            walker_state, walker, distance = self._vehicle_obstacle_detected(walker_list, self._dynamic_forward_distance(max(
+                self._behavior.min_proximity_threshold, self._speed_limit / 2)), up_angle_th=90, lane_offset=-1)
         elif self._direction == RoadOption.CHANGELANERIGHT:
-            walker_state, walker, distance = self._vehicle_obstacle_detected(walker_list, max(
-                self._behavior.min_proximity_threshold, self._speed_limit / 2), up_angle_th=90, lane_offset=1)
+            walker_state, walker, distance = self._vehicle_obstacle_detected(walker_list, self._dynamic_forward_distance(max(
+                self._behavior.min_proximity_threshold, self._speed_limit / 2)), up_angle_th=90, lane_offset=1)
         else:
-            walker_state, walker, distance = self._vehicle_obstacle_detected(walker_list, max(
-                self._behavior.min_proximity_threshold, self._speed_limit / 3), up_angle_th=60)
+            walker_state, walker, distance = self._vehicle_obstacle_detected(walker_list, self._collision_detection_range(), up_angle_th=60)
 
         return walker_state, walker, distance
 
@@ -1026,7 +1080,7 @@ class BehaviorAgent(BasicAgent):
                 positive(vehicle_speed - self._behavior.speed_decrease),
                 self._behavior.max_speed,
                 self._speed_limit - self._behavior.speed_lim_dist])
-            self._local_planner.set_speed(target_speed)
+            self._local_planner.set_speed(self._clamp_to_speed_limit(target_speed))
             control = self._local_planner.run_step(debug=debug)
 
         # Actual safety distance area, try to follow the speed of the vehicle in front.
@@ -1035,7 +1089,7 @@ class BehaviorAgent(BasicAgent):
                 max(self._min_speed, vehicle_speed),
                 self._behavior.max_speed,
                 self._speed_limit - self._behavior.speed_lim_dist])
-            self._local_planner.set_speed(target_speed)
+            self._local_planner.set_speed(self._clamp_to_speed_limit(target_speed))
             control = self._local_planner.run_step(debug=debug)
 
         # Normal behavior.
@@ -1043,12 +1097,29 @@ class BehaviorAgent(BasicAgent):
             target_speed = min([
                 self._behavior.max_speed,
                 self._speed_limit - self._behavior.speed_lim_dist])
-            self._local_planner.set_speed(target_speed)
+            self._local_planner.set_speed(self._clamp_to_speed_limit(target_speed))
             control = self._local_planner.run_step(debug=debug)
 
         return control
 
 #----------------------------------------------------------------------------------------------#
+
+    def _clamp_to_speed_limit(self, target_speed):
+        """
+        Hard safety net: never request a cruise speed above the posted
+        speed limit, whichever branch computed it. Every formula above
+        already subtracts a margin (`speed_lim_dist`) before capping, so
+        this should be a no-op in practice - it only guards against a
+        branch forgetting that margin (e.g. the junction branch below uses
+        a fixed "-5" instead of `speed_lim_dist`) or a transient overshoot
+        requested upstream. Note this does not fix PID overshoot inside
+        the longitudinal controller itself (controller.py) - that would
+        need its own tuning, out of scope here.
+
+            :param target_speed: the cruise speed a branch wants to request
+            :return: target_speed, capped at the current speed limit
+        """
+        return min(target_speed, self._speed_limit)
 
     def run_step(self, debug=False):
         """
@@ -1082,6 +1153,8 @@ class BehaviorAgent(BasicAgent):
                 walker.bounding_box.extent.y, walker.bounding_box.extent.x) - max(
                     self._vehicle.bounding_box.extent.y, self._vehicle.bounding_box.extent.x)
 
+            # Emergency brake if the car is very close (distance threshold
+            # scales with current speed, see _effective_braking_distance).
             if distance < self._effective_braking_distance():
                 self._update_pedestrian_wait_tracking(walker)
                 if self._pedestrian_wait_timed_out() and self._pedestrian_is_stationary(walker):
@@ -1092,12 +1165,12 @@ class BehaviorAgent(BasicAgent):
         else:
             self._update_pedestrian_wait_tracking(None)
 
-        # 2.15: Control-loss stabilization 
+        # 2.15: Control-loss stabilization
         if self.control_loss_manager(ego_vehicle_wp):
             target_speed = min([
                 self._control_loss_stabilize_speed(),
                 self._behavior.max_speed])
-            self._local_planner.set_speed(target_speed)
+            self._local_planner.set_speed(self._clamp_to_speed_limit(target_speed))
             return self._local_planner.run_step(debug=debug)
 
         # 2.2: Static obstacle bypass behavior (construction/accident/parked vehicle)
@@ -1105,7 +1178,7 @@ class BehaviorAgent(BasicAgent):
             target_speed = min([
                 self._behavior.max_speed,
                 self._speed_limit - self._behavior.speed_lim_dist])
-            self._local_planner.set_speed(target_speed)
+            self._local_planner.set_speed(self._clamp_to_speed_limit(target_speed))
             return self._local_planner.run_step(debug=debug)
 
         # 2.3: Car following behaviors
@@ -1118,6 +1191,8 @@ class BehaviorAgent(BasicAgent):
                 vehicle.bounding_box.extent.y, vehicle.bounding_box.extent.x) - max(
                     self._vehicle.bounding_box.extent.y, self._vehicle.bounding_box.extent.x)
 
+            # Emergency brake if the car is very close (distance threshold
+            # scales with current speed, see _effective_braking_distance).
             if distance < self._effective_braking_distance():
                 return self.emergency_stop()
             else:
@@ -1131,7 +1206,7 @@ class BehaviorAgent(BasicAgent):
                 target_speed = min([
                     self._behavior.max_speed,
                     self._speed_limit - 5])
-                self._local_planner.set_speed(target_speed)
+                self._local_planner.set_speed(self._clamp_to_speed_limit(target_speed))
                 control = self._local_planner.run_step(debug=debug)
 
         # 4: Normal behavior
@@ -1139,7 +1214,7 @@ class BehaviorAgent(BasicAgent):
             target_speed = min([
                 self._behavior.max_speed,
                 self._speed_limit - self._behavior.speed_lim_dist])
-            self._local_planner.set_speed(target_speed)
+            self._local_planner.set_speed(self._clamp_to_speed_limit(target_speed))
             control = self._local_planner.run_step(debug=debug)
 
         return control
