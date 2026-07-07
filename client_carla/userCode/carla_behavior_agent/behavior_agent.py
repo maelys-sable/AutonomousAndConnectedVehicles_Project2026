@@ -81,6 +81,10 @@ class BehaviorAgent(BasicAgent):
     #                      _waiting_gap_speed, _bypass_drive_control,     #
     #                      _bypass_forward_clear                        #
     #     logs           : _log_bypass_transition                       #
+    #     diagnostic (hors etats, appelable a tout moment) :             #
+    #                      bypass_diagnostics, format_bypass_            #
+    #                      diagnostics, log_bypass_diagnostics,          #
+    #                      BYPASS_DEBUG                                 #
     #                                                                    #
     #   Appeles a chaque tick, hors arbre ci-dessus :                    #
     #     _update_information, _refresh_actor_snapshot,                  #
@@ -127,6 +131,12 @@ class BehaviorAgent(BasicAgent):
 
     STATE_LOG_INTERVAL = 20
     BYPASS_TIMEOUT_TICKS = 800
+    BYPASS_DEBUG = True   # opt-in: prints bypass_diagnostics every tick a
+                          # manoeuvre is active (see log_bypass_diagnostics),
+                          # instead of adding print statements by hand each
+                          # time the raw numbers behind a decision are needed.
+                          # Set back to False once the current investigation
+                          # is done, to keep the logs quiet again.
 
     # Junction crossing (Block 3: BlockedIntersection / NonSignalizedJunctionRightTurn)
     JUNCTION_DETECTION_DISTANCE = 30
@@ -1224,6 +1234,156 @@ class BehaviorAgent(BasicAgent):
         self._set_lane_offset(0.0)
         self._exit_bypass_caution()
 
+    def bypass_diagnostics(self, waypoint):
+        """
+        Snapshot of every measurement the bypass manoeuvre depends on, at
+        the current tick: lane/vehicle geometry, the static obstacle
+        cluster ahead, and the oncoming-traffic situation on the opposite
+        lane. Pure read -- it recomputes nothing the bypass logic doesn't
+        already compute elsewhere (`_obstacles_ahead`, `_oncoming_lane_
+        obstacle`, `_gap_is_safe`, etc.) and changes no state. Meant to
+        be printed/logged (see `log_bypass_diagnostics`) when deciding
+        what the manoeuvre should do next, without needing a fresh
+        simulation run to see the raw numbers behind a given decision.
+
+            :param waypoint: the agent's current waypoint
+            :return: dict with the following keys:
+                - 'bypass_state': current state of the bypass state machine
+                - 'lane_width': width (m) of the agent's current lane
+                - 'vehicle_width' / 'vehicle_half_width': ego vehicle's
+                  own width (m), from its bounding box
+                - 'max_in_lane_offset': largest lateral offset (m) an
+                  in-lane nudge could use without leaving the lane (see
+                  `_lane_max_offset`); <= 0 means the lane is too narrow
+                  for any in-lane nudge
+                - 'static_obstacles_ahead': list of dicts, nearest first,
+                  one per tracked static obstacle, each with 'id',
+                  'type_id', 'distance', 'lateral_offset' (signed, +right)
+                  and 'side_clearance_needed' (signed offset an in-lane
+                  nudge would need to clear THIS obstacle alone)
+                - 'farthest_obstacle_distance': distance (m) to the
+                  farthest tracked obstacle -- what a full bypass must
+                  clear before merging back
+                - 'widest_in_lane_offset_needed': the offset an in-lane
+                  nudge would need to clear every tracked obstacle at
+                  once, or None if none fits (see `_widest_bypass_offset`)
+                - 'right_lane': {'usable': bool, 'clear': bool or None}
+                - 'oncoming': {'detected': bool, 'vehicle_id', 'distance',
+                  'speed_kmh', 'time_to_arrival_s', 'gap_safe'} -- the
+                  nearest vehicle on the opposite lane used for a
+                  left-side bypass, and whether `_gap_is_safe` currently
+                  considers that gap safe to cross into
+        """
+        vehicle_half_width = self._vehicle.bounding_box.extent.y
+
+        static_obstacles = []
+        for obstacle in self._obstacles_ahead(waypoint):
+            static_obstacles.append({
+                'id': obstacle.id,
+                'type_id': obstacle.type_id,
+                'distance': obstacle.get_location().distance(waypoint.transform.location),
+                'lateral_offset': self._obstacle_lateral_offset(waypoint, obstacle),
+                'half_width': obstacle.bounding_box.extent.y,
+                'side_clearance_needed': self._obstacle_side_clearance(waypoint, obstacle),
+            })
+
+        oncoming_state, oncoming_vehicle, oncoming_distance = self._oncoming_lane_obstacle(waypoint)
+        oncoming_speed = get_speed(oncoming_vehicle) if oncoming_vehicle is not None else None
+        oncoming_ttc = None
+        if oncoming_state and oncoming_speed and oncoming_speed > 0:
+            oncoming_ttc = oncoming_distance / (oncoming_speed / 3.6)
+
+        right_wpt = self._right_lane_usable(waypoint)
+
+        return {
+            'bypass_state': self._bypass_state,
+            'lane_width': waypoint.lane_width,
+            'vehicle_width': vehicle_half_width * 2,
+            'vehicle_half_width': vehicle_half_width,
+            'max_in_lane_offset': self._lane_max_offset(waypoint),
+            'static_obstacles_ahead': static_obstacles,
+            'farthest_obstacle_distance': self._farthest_obstacle_distance(waypoint),
+            'widest_in_lane_offset_needed': self._widest_bypass_offset(waypoint),
+            'right_lane': {
+                'usable': right_wpt is not None,
+                'clear': self._right_lane_clear(waypoint) if right_wpt is not None else None,
+            },
+            'oncoming': {
+                'detected': oncoming_state,
+                'vehicle_id': oncoming_vehicle.id if oncoming_vehicle is not None else None,
+                'distance': oncoming_distance if oncoming_state else None,
+                'speed_kmh': oncoming_speed,
+                'time_to_arrival_s': oncoming_ttc,
+                'gap_safe': self._gap_is_safe(
+                    oncoming_distance if oncoming_state else -1,
+                    oncoming_speed if oncoming_speed is not None else 0),
+            },
+        }
+
+    def format_bypass_diagnostics(self, report):
+        """
+        Renders a `bypass_diagnostics` report as a compact, greppable,
+        multi-line string (mirrors the `[BYPASS] ...` log style already
+        used by `_log_bypass_transition`).
+
+            :param report: dict returned by `bypass_diagnostics`
+            :return: formatted string, ready to `print`
+        """
+        lines = [
+            f"[BYPASS-INFO] state={report['bypass_state']} "
+            f"lane_width={report['lane_width']:.2f}m "
+            f"vehicle_width={report['vehicle_width']:.2f}m "
+            f"max_in_lane_offset={report['max_in_lane_offset']:.2f}m",
+        ]
+
+        if report['static_obstacles_ahead']:
+            for obs in report['static_obstacles_ahead']:
+                lines.append(
+                    f"[BYPASS-INFO]   obstacle id={obs['id']} type={obs['type_id']} "
+                    f"distance={obs['distance']:.1f}m lateral_offset={obs['lateral_offset']:.2f}m "
+                    f"half_width={obs['half_width']:.2f}m "
+                    f"side_clearance_needed={obs['side_clearance_needed']:.2f}m")
+        else:
+            lines.append("[BYPASS-INFO]   no static obstacle currently tracked")
+
+        lines.append(
+            f"[BYPASS-INFO]   farthest_obstacle_distance={report['farthest_obstacle_distance']:.1f}m "
+            f"widest_in_lane_offset_needed="
+            f"{report['widest_in_lane_offset_needed']}")
+
+        right = report['right_lane']
+        lines.append(f"[BYPASS-INFO]   right_lane usable={right['usable']} clear={right['clear']}")
+
+        oncoming = report['oncoming']
+        if oncoming['detected']:
+            ttc = oncoming['time_to_arrival_s']
+            ttc_str = f"{ttc:.1f}s" if ttc is not None else "n/a"
+            lines.append(
+                f"[BYPASS-INFO]   oncoming vehicle_id={oncoming['vehicle_id']} "
+                f"distance={oncoming['distance']:.1f}m speed={oncoming['speed_kmh']:.1f}km/h "
+                f"time_to_arrival={ttc_str} gap_safe={oncoming['gap_safe']}")
+        else:
+            lines.append(f"[BYPASS-INFO]   oncoming lane clear (gap_safe={oncoming['gap_safe']})")
+
+        return "\n".join(lines)
+
+    def log_bypass_diagnostics(self, waypoint):
+        """
+        Convenience wrapper: computes `bypass_diagnostics` and prints it
+        via `format_bypass_diagnostics`. Not called automatically from
+        `run_step` -- toggle `BYPASS_DEBUG = True` on the class (or an
+        instance) if you want it printed every tick a manoeuvre is active,
+        without needing to add print statements by hand each time you
+        want to see the numbers behind a decision.
+
+            :param waypoint: the agent's current waypoint
+            :return: the report dict (same as `bypass_diagnostics`),
+                     already printed
+        """
+        report = self.bypass_diagnostics(waypoint)
+        print(self.format_bypass_diagnostics(report))
+        return report
+
     def bypass_obstacle_manager(self, waypoint):
         """
         Generic module for static obstacle avoidance. Drives the cycle of
@@ -1638,6 +1798,8 @@ class BehaviorAgent(BasicAgent):
             self._update_pedestrian_wait_tracking(None)
 
         # 2.2: Static obstacle bypass behavior (construction/accident/parked vehicle)
+        if self.BYPASS_DEBUG and self._bypass_state != 'idle':
+            self.log_bypass_diagnostics(ego_vehicle_wp)
         if self.bypass_obstacle_manager(ego_vehicle_wp):
             return self._bypass_drive_control(ego_vehicle_wp, debug=debug)
 
