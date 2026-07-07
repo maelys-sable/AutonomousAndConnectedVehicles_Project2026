@@ -8,6 +8,7 @@
 waypoints and avoiding other vehicles. The agent also responds to traffic lights,
 traffic signs, and has different possible configurations. """
 
+import math
 import random
 import numpy as np
 import carla
@@ -40,25 +41,25 @@ class BehaviorAgent(BasicAgent):
     STATE_LOG_INTERVAL = 20
     BYPASS_TIMEOUT_TICKS = 800
 
-    # Junction crossing (Block 3: BlockedIntersection / NonSignalizedJunctionRightTurn)
     JUNCTION_DETECTION_DISTANCE = 30
     JUNCTION_MIN_GAP_TIME = 3.0
     JUNCTION_TIMEOUT_TICKS = 300
 
-    # Stalled-vehicle detection (AccidentTwoWays with a wrecked vehicle rather
-    # than a static.prop): a vehicle ahead reporting near-zero speed for a
-    # sustained period is treated as a permanent obstacle to bypass, the same
-    # way a construction cone or a parked car already are.
-    STALL_SPEED_THRESHOLD = 1.0    # km/h, considered "not moving"
-    STALL_TIMEOUT_TICKS = 150      # ~7.5s at 20 FPS before it's confirmed stalled
-                                    # (long enough not to mistake a stop-sign/queue pause for a wreck)
+    STALL_SPEED_THRESHOLD = 1.0
+    STALL_TIMEOUT_TICKS = 150
 
-    # Pedestrian wait (non-blocage indéfini): a loitering pedestrian near the
-    # road (background NPC, not a scripted scenario) can otherwise force an
-    # unconditional, permanent emergency_stop with no re-evaluation.
-    PEDESTRIAN_WAIT_TIMEOUT_TICKS = 200   # ~10s at 20 FPS before creeping past
-    PEDESTRIAN_STATIONARY_SPEED = 0.5     # km/h, considered "not walking"
-    PEDESTRIAN_CREEP_SPEED = 5            # km/h, cautious speed once timed out
+    PEDESTRIAN_WAIT_TIMEOUT_TICKS = 200
+    PEDESTRIAN_STATIONARY_SPEED = 0.5
+    PEDESTRIAN_CREEP_SPEED = 5            
+
+    CONTROL_LOSS_HEADING_THRESHOLD = 25.0
+    CONTROL_LOSS_RECOVERY_THRESHOLD = 8.0   
+    CONTROL_LOSS_MIN_SPEED_KMH = 5.0        
+    CONTROL_LOSS_STABILIZE_SPEED = 20.0     
+    CONTROL_LOSS_TIMEOUT_TICKS = 400        
+
+    WET_HEADING_MARGIN = 0.7   
+    WET_SPEED_MARGIN = 0.7     
 
     def __init__(self, vehicle, behavior='normal', opt_dict={}, map_inst=None, grp_inst=None):
         """
@@ -112,6 +113,10 @@ class BehaviorAgent(BasicAgent):
         # Pedestrian wait tracking (see PEDESTRIAN_WAIT_TIMEOUT_TICKS)
         self._pedestrian_wait_id = None
         self._pedestrian_wait_tick_counter = 0
+
+        # Cycle : 'idle' -> 'stabilizing' -> 'idle' (Block 5: ControlLoss)
+        self._control_loss_state = 'idle'
+        self._control_loss_tick_counter = 0
 
     def _refresh_actor_snapshot(self):
         """
@@ -772,6 +777,171 @@ class BehaviorAgent(BasicAgent):
 
 #----------------------------------------------------------------------------------------------#
 
+    def _road_heading(self, waypoint):
+        """
+        :param waypoint: the agent's current waypoint
+        :return: the road's own heading (degrees) at that waypoint
+        """
+        return waypoint.transform.rotation.yaw
+
+    def _velocity_heading(self):
+        """
+        :return: the vehicle's actual direction of travel (degrees), taken
+            from its velocity vector rather than its bodywork orientation,
+            so a sideways skid is visible even if the chassis still points
+            forward.
+        """
+        vel = self._vehicle.get_velocity()
+        return math.degrees(math.atan2(vel.y, vel.x))
+
+    def _heading_deviation(self, waypoint):
+        """
+        Angular gap (0-180°) between the vehicle's actual velocity heading
+        and the road heading at the CURRENT waypoint. Comparing against the
+        current waypoint (which already follows the curve) rather than a
+        fixed reference means a normal bend is not mistaken for a skid -
+        only an uncommanded slide relative to the road right there shows
+        up as a large gap.
+
+            :param waypoint: the agent's current waypoint
+            :return: absolute angular deviation in degrees
+        """
+        diff = (self._velocity_heading() - self._road_heading(waypoint)) % 360.0
+        if diff > 180.0:
+            diff = 360.0 - diff
+        return diff
+
+    def _wet_severity(self):
+        """
+        0 (dry) to 1 (fully wet) read from the world's current weather, used
+        to tighten the control-loss margins as the route's weather degrades
+        (§4.2: "adhérence réduite ajoutée à la perte de contrôle simulée").
+        Never raises: falls back to 0 (dry) if the weather can't be read,
+        e.g. in unit tests that don't stub a world weather.
+
+            :return: wetness severity between 0.0 and 1.0
+        """
+        try:
+            weather = self._world.get_weather()
+        except AttributeError:
+            return 0.0
+        wetness = getattr(weather, 'wetness', 0.0)
+        precipitation = getattr(weather, 'precipitation', 0.0)
+        return max(wetness, precipitation) / 100.0
+
+    def _control_loss_heading_threshold(self):
+        """
+        :return: CONTROL_LOSS_HEADING_THRESHOLD, narrowed towards
+            WET_HEADING_MARGIN as the weather gets wetter (so the agent
+            reacts to a smaller deviation once grip is already reduced).
+        """
+        severity = self._wet_severity()
+        margin = 1.0 - (1.0 - self.WET_HEADING_MARGIN) * severity
+        return self.CONTROL_LOSS_HEADING_THRESHOLD * margin
+
+    def _control_loss_stabilize_speed(self):
+        """
+        :return: CONTROL_LOSS_STABILIZE_SPEED, lowered towards
+            WET_SPEED_MARGIN as the weather gets wetter.
+        """
+        severity = self._wet_severity()
+        margin = 1.0 - (1.0 - self.WET_SPEED_MARGIN) * severity
+        return self.CONTROL_LOSS_STABILIZE_SPEED * margin
+
+    def _control_loss_detected(self, waypoint):
+        """
+        :param waypoint: the agent's current waypoint
+        :return: True if the vehicle's heading has drifted away from the
+            road by more than the (weather-adjusted) threshold, at a speed
+            high enough for heading to be meaningful.
+        """
+        if self._speed < self.CONTROL_LOSS_MIN_SPEED_KMH:
+            return False
+        return self._heading_deviation(waypoint) > self._control_loss_heading_threshold()
+
+    def _control_loss_recovered(self, waypoint):
+        """
+        :param waypoint: the agent's current waypoint
+        :return: True once the heading deviation has fallen back under the
+            (lower) recovery threshold - the hysteresis gap between
+            trigger and recovery avoids flapping in and out of the state
+            on borderline readings.
+        """
+        return self._heading_deviation(waypoint) < self.CONTROL_LOSS_RECOVERY_THRESHOLD
+
+    def _control_loss_timed_out(self):
+        """
+        :return: True once stabilization has been active for longer than
+            CONTROL_LOSS_TIMEOUT_TICKS, so a stuck reading can't cap the
+            vehicle's speed forever.
+        """
+        self._control_loss_tick_counter += 1
+        return self._control_loss_tick_counter > self.CONTROL_LOSS_TIMEOUT_TICKS
+
+    def _reset_control_loss_state(self):
+        """Resets the status of the control-loss stabilization module."""
+        self._control_loss_state = 'idle'
+        self._control_loss_tick_counter = 0
+
+    def _log_control_loss_transition(self, event, waypoint=None):
+        """
+        Single entry point for control-loss log messages, mirroring
+        `_log_bypass_transition` / `_log_junction_transition`.
+
+            :param event: 'detected' | 'recovered' | 'timeout'
+            :param waypoint: the agent's current waypoint (optional)
+        """
+        loc = waypoint.transform.location if waypoint is not None else None
+        pos = f" pos=({loc.x:.1f}, {loc.y:.1f})" if loc is not None else ""
+        messages = {
+            'detected': f"[CONTROL_LOSS] Uncommanded heading deviation{pos} -> stabilizing (throttle only)",
+            'recovered': f"[CONTROL_LOSS] TEST SUCCESSFUL: heading back under control{pos}",
+            'timeout': f"[CONTROL_LOSS] TEST FAILED: stabilization did not clear in time{pos}",
+        }
+        print(messages[event])
+        if event == 'recovered':
+            self._scenario_result = True
+        elif event == 'timeout':
+            self._scenario_result = False
+
+    def control_loss_manager(self, waypoint):
+        """
+        Generic stabilization module for `ControlLoss` : detects
+        an uncommanded heading deviation (skid) and, while it persists,
+        caps cruise speed to a cautious value using THROTTLE ONLY - never
+        `emergency_stop`'s hard brake, since braking hard mid-skid tends to
+        make it worse. Steering itself is left to the local planner /
+        lateral controller, which already corrects progressively rather
+        than snapping back (see controller.py's steering-rate limiting) -
+        this module's job is only to not fight that recovery with an
+        abrupt braking input.
+
+            :param waypoint: the agent's current waypoint
+            :return: True while a stabilization response is in progress
+                     (caller should apply the reduced cruise speed instead
+                     of its normal behaviour)
+        """
+        if self._control_loss_state == 'idle':
+            if self._control_loss_detected(waypoint):
+                self._control_loss_state = 'stabilizing'
+                self._control_loss_tick_counter = 0
+                self._log_control_loss_transition('detected', waypoint)
+            return self._control_loss_state != 'idle'
+
+        if self._control_loss_timed_out():
+            self._log_control_loss_transition('timeout', waypoint)
+            self._reset_control_loss_state()
+            return False
+
+        if self._control_loss_recovered(waypoint):
+            self._log_control_loss_transition('recovered', waypoint)
+            self._reset_control_loss_state()
+            return False
+
+        return True
+
+#----------------------------------------------------------------------------------------------#
+
     def car_following_manager(self, vehicle, distance, debug=False):
         """
         Module in charge of car-following behaviors when there's
@@ -859,6 +1029,14 @@ class BehaviorAgent(BasicAgent):
             self._update_pedestrian_wait_tracking(None)
         else:
             self._update_pedestrian_wait_tracking(None)
+
+        # 2.15: Control-loss stabilization 
+        if self.control_loss_manager(ego_vehicle_wp):
+            target_speed = min([
+                self._control_loss_stabilize_speed(),
+                self._behavior.max_speed])
+            self._local_planner.set_speed(target_speed)
+            return self._local_planner.run_step(debug=debug)
 
         # 2.2: Static obstacle bypass behavior (construction/accident/parked vehicle)
         if self.bypass_obstacle_manager(ego_vehicle_wp):
