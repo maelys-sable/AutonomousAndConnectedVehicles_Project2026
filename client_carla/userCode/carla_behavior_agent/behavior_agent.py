@@ -35,6 +35,16 @@ class BehaviorAgent(BasicAgent):
     FORWARD_ANGLE_STRAIGHT = 30
     FORWARD_ANGLE_TURN = 60
 
+    # Dynamic safety margin (Route1_Plan_Strategie_Obstacles.md §3.2/§4.1:
+    # "prévoir une marge de sécurité dynamique plutôt qu'une distance fixe").
+    # A detection/braking distance tied only to the speed limit or a fixed
+    # meter value gives less real reaction TIME as cruising speed rises -
+    # this is what let the agent close on slow-moving cyclists faster than
+    # it could react/brake. These add a speed-proportional margin (in
+    # seconds of travel) on top of the existing static base values.
+    DETECTION_SPEED_MARGIN_SECONDS = 2.5   # extra forward detection range, in seconds of travel
+    BRAKING_SPEED_MARGIN_SECONDS = 0.8     # extra emergency-stop trigger distance, in seconds of travel
+
     BYPASS_DETECTION_DISTANCE = 80
     BYPASS_MIN_GAP_TIME = 4.0
 
@@ -148,7 +158,7 @@ class BehaviorAgent(BasicAgent):
         to ensure a consistent format and to make it easy to grep the logs 
         (e.g. test success/failure).
 
-            :param event: 'detected' | 'gap_found' | 'success' | 'timeout'
+            :param event: 'detected' | 'gap_found' | 'success' | 'timeout' | 'no_lane'
             :param waypoint: the agent’s current waypoint (optional)
         """
         loc = waypoint.transform.location if waypoint is not None else None
@@ -159,11 +169,12 @@ class BehaviorAgent(BasicAgent):
             'success': f"[BYPASS] TEST SUCCESSFUL: obstacle bypassed, back on track{pos}",
             'timeout': f"[BYPASS] TEST FAILED: manoeuvre timed out{pos}"
                        f"(stuck in '{self._bypass_state}')",
+            'no_lane': f"[BYPASS] TEST FAILED: no usable opposite lane{pos} -> abandoning bypass",
         }
         print(messages[event])
         if event == 'success':
             self._scenario_result = True
-        elif event == 'timeout':
+        elif event in ('timeout', 'no_lane'):
             self._scenario_result = False
 
     def _bypass_timed_out(self):
@@ -272,6 +283,47 @@ class BehaviorAgent(BasicAgent):
         """
         return self._incoming_direction in (RoadOption.LEFT, RoadOption.RIGHT)
 
+    def _dynamic_forward_distance(self, base_distance):
+        """
+        Widens a static base distance by how far the vehicle travels in
+        DETECTION_SPEED_MARGIN_SECONDS at its CURRENT speed, so cruising
+        faster automatically buys more reaction room instead of a range
+        tied only to the road's speed limit (§3.2/§4.1).
+
+            :param base_distance: static minimum distance to widen
+            :return: base_distance plus a speed-proportional margin (m)
+        """
+        speed_ms = self._speed / 3.6
+        return base_distance + speed_ms * self.DETECTION_SPEED_MARGIN_SECONDS
+
+    def _effective_braking_distance(self):
+        """
+        The behavior's base `braking_distance`, extended by the vehicle's
+        current speed so the emergency-stop trigger keeps a comparable time
+        margin at higher speed rather than a fixed number of meters
+        regardless of how fast the agent is going.
+
+            :return: effective emergency-stop trigger distance (m)
+        """
+        speed_ms = self._speed / 3.6
+        return self._behavior.braking_distance + speed_ms * self.BRAKING_SPEED_MARGIN_SECONDS
+
+    def _collision_detection_range(self):
+        """
+        Forward range used both to gather obstacle candidates
+        (`_build_obstacle_list`) and to test them (`_forward_obstacle_detected`):
+        kept identical so widening one never leaves the other as a hidden
+        bottleneck (a fixed 45 m candidate-gathering radius would silently
+        cap the detection range no matter how far `_dynamic_forward_distance`
+        pushes it out).
+
+            :return: forward detection range (m)
+        """
+        base = max(self.OBSTACLE_MAX_DISTANCE,
+                   self._behavior.min_proximity_threshold,
+                   self._speed_limit / 3)
+        return self._dynamic_forward_distance(base)
+
     def _forward_detection_angle(self):
         """
         Frontal detection angle to be used: widened when cornering to detect
@@ -298,14 +350,14 @@ class BehaviorAgent(BasicAgent):
     def _forward_obstacle_detected(self, vehicle_list):
         """
         Detects an obstacle approaching head-on, with an expanded detection angle
-        when cornering (see `_forward_detection_angle`).
+        when cornering (see `_forward_detection_angle`) and a detection range
+        that grows with the vehicle's current speed (see `_collision_detection_range`).
 
             :param vehicle_list: list of obstacles to consider
             :return: tuple (vehicle_state, vehicle, distance)
         """
         return self._vehicle_obstacle_detected(
-            vehicle_list, max(
-                self._behavior.min_proximity_threshold, self._speed_limit / 3),
+            vehicle_list, self._collision_detection_range(),
             up_angle_th=self._forward_detection_angle())
 
     def collision_and_car_avoid_manager(self, waypoint):
@@ -320,7 +372,7 @@ class BehaviorAgent(BasicAgent):
             :return distance: distance to nearby vehicle
         """
 
-        vehicle_list = self._build_obstacle_list(waypoint)
+        vehicle_list = self._build_obstacle_list(waypoint, max_distance=self._collision_detection_range())
 
         if self._direction == RoadOption.CHANGELANELEFT:
             vehicle_state, vehicle, distance = self._lane_change_obstacle_detected(vehicle_list, lane_offset=-1)
@@ -467,14 +519,21 @@ class BehaviorAgent(BasicAgent):
 
     def _start_bypass_maneuver(self, waypoint):
         """
-        Triggers a lateral shift to the opposite lane to bypass the obstacle 
+        Triggers a lateral shift to the opposite lane to bypass the obstacle
         (same mechanism as `_tailgating`: redefine the local destination to the adjacent lane).
 
-            :param waypoint: the agent’s current waypoint
+            :param waypoint: the agent's current waypoint
+            :return: True if the manoeuvre could be started, False if there
+                     is no usable opposite lane at this point (edge of the
+                     road, junction, etc.) - the caller must then abandon
+                     the bypass instead of crashing on a None waypoint.
         """
         opposite_wpt = waypoint.get_left_lane()
+        if opposite_wpt is None or opposite_wpt.lane_type != carla.LaneType.Driving:
+            return False
         end_waypoint = self._local_planner.target_waypoint
         self.set_destination(end_waypoint.transform.location, opposite_wpt.transform.location)
+        return True
 
     def _obstacle_cleared(self, waypoint):
         """
@@ -531,9 +590,13 @@ class BehaviorAgent(BasicAgent):
 
         if self._bypass_state == 'waiting_gap':
             if self._can_start_bypass(waypoint):
-                self._start_bypass_maneuver(waypoint)
-                self._bypass_state = 'overtaking'
-                self._log_bypass_transition('gap_found', waypoint)
+                if self._start_bypass_maneuver(waypoint):
+                    self._bypass_state = 'overtaking'
+                    self._log_bypass_transition('gap_found', waypoint)
+                else:
+                    self._log_bypass_transition('no_lane', waypoint)
+                    self._reset_bypass_state()
+                    return False
             return True
 
         if self._bypass_state == 'overtaking':
@@ -906,7 +969,7 @@ class BehaviorAgent(BasicAgent):
 
     def control_loss_manager(self, waypoint):
         """
-        Generic stabilization module for `ControlLoss` : detects
+        Generic stabilization module for `ControlLoss` (§3.8/§6.2): detects
         an uncommanded heading deviation (skid) and, while it persists,
         caps cruise speed to a cautious value using THROTTLE ONLY - never
         `emergency_stop`'s hard brake, since braking hard mid-skid tends to
@@ -1019,8 +1082,7 @@ class BehaviorAgent(BasicAgent):
                 walker.bounding_box.extent.y, walker.bounding_box.extent.x) - max(
                     self._vehicle.bounding_box.extent.y, self._vehicle.bounding_box.extent.x)
 
-            # Emergency brake if the car is very close.
-            if distance < self._behavior.braking_distance:
+            if distance < self._effective_braking_distance():
                 self._update_pedestrian_wait_tracking(walker)
                 if self._pedestrian_wait_timed_out() and self._pedestrian_is_stationary(walker):
                     self._log_pedestrian_wait_timeout(ego_vehicle_wp)
@@ -1056,8 +1118,7 @@ class BehaviorAgent(BasicAgent):
                 vehicle.bounding_box.extent.y, vehicle.bounding_box.extent.x) - max(
                     self._vehicle.bounding_box.extent.y, self._vehicle.bounding_box.extent.x)
 
-            # Emergency brake if the car is very close.
-            if distance < self._behavior.braking_distance:
+            if distance < self._effective_braking_distance():
                 return self.emergency_stop()
             else:
                 control = self.car_following_manager(vehicle, distance)
