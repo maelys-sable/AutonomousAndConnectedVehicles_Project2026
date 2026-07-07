@@ -76,7 +76,9 @@ class BehaviorAgent(BasicAgent):
     #                      _reset_bypass_state                          #
     #     profil/vitesse : _enter_bypass_caution, _exit_bypass_caution,  #
     #                      _bypass_target_speed, _bypass_convergence_    #
-    #                      speed, _bypass_drive_control,                 #
+    #                      speed, _nudge_convergence_speed,               #
+    #                      _overtaking_transition_speed,                  #
+    #                      _waiting_gap_speed, _bypass_drive_control,     #
     #                      _bypass_forward_clear                        #
     #     logs           : _log_bypass_transition                       #
     #                                                                    #
@@ -109,6 +111,19 @@ class BehaviorAgent(BasicAgent):
                                      # lane -- short of the width it needed -- by the time the
                                      # agent reached the obstacle, clipping it (see the collision
                                      # right after "Gap found -> start of manoeuvre" in the logs).
+    BYPASS_WAITING_STOP_DISTANCE = 20  # m, distance to the tracked obstacle at which the agent
+                                        # must be fully stopped if no gap has opened yet. Per the
+                                        # strategy doc (ConstructionObstacleTwoWays/ParkedObstacleTwoWays
+                                        # /AccidentTwoWays -- "ralentir et attendre une fenetre de
+                                        # degagement avant de contourner"): while 'waiting_gap',
+                                        # the agent used to cruise at the manoeuvre's normal speed
+                                        # the entire time no gap was found, since nothing capped
+                                        # its speed in that state -- only `_bypass_forward_clear`'s
+                                        # BYPASS_FORWARD_MARGIN (8 m) last-resort emergency brake
+                                        # eventually fired, far too late to stop from ~25 km/h (see
+                                        # the log: no "Gap found" message ever appears before the
+                                        # collision). This constant sizes a deceleration ramp so the
+                                        # agent comes to a controlled stop well before that.
 
     STATE_LOG_INTERVAL = 20
     BYPASS_TIMEOUT_TICKS = 800
@@ -1068,10 +1083,50 @@ class BehaviorAgent(BasicAgent):
             return self.BYPASS_MIN_MANEUVER_SPEED
         return base_speed
 
+    def _waiting_gap_speed(self, waypoint, base_speed):
+        """
+        Speed while 'waiting_gap' -- a blocking obstacle is confirmed but
+        no safe gap in oncoming traffic has been found yet to start the
+        full lane-level bypass. Per the strategy doc's guidance for
+        ConstructionObstacleTwoWays/ParkedObstacleTwoWays/AccidentTwoWays
+        ("ralentir et attendre une fenetre de degagement avant de
+        contourner"): ramps down linearly from `base_speed` to a full
+        stop as the tracked obstacle's distance shrinks from
+        `BYPASS_DETECTION_DISTANCE` down to `BYPASS_WAITING_STOP_DISTANCE`.
+
+        Without this, the agent cruised at `base_speed` for the entire
+        wait -- since nothing capped speed in this state before -- and
+        only braked once `_bypass_forward_clear`'s BYPASS_FORWARD_MARGIN
+        (8 m) threshold tripped, far too late to stop from ~25 km/h (see
+        the log: no "Gap found" message ever appears before the
+        collision, meaning the agent was still 'waiting_gap' -- still
+        cruising -- right up to impact).
+
+            :param waypoint: the agent's current waypoint
+            :param base_speed: uncapped manoeuvre speed (see `_bypass_target_speed`)
+            :return: target speed in km/h
+        """
+        _, _, distance = self._blocking_obstacle_ahead(waypoint)
+        if distance is None or distance < 0:
+            return base_speed
+
+        stop_distance = self.BYPASS_WAITING_STOP_DISTANCE
+        if distance <= stop_distance:
+            return 0.0
+
+        detection_range = self.BYPASS_DETECTION_DISTANCE
+        if distance >= detection_range or detection_range <= stop_distance:
+            return base_speed
+
+        severity = (detection_range - distance) / (detection_range - stop_distance)
+        return base_speed * (1.0 - severity)
+
     def _bypass_convergence_speed(self, waypoint):
         """
         Speed cap applied while a bypass manoeuvre needs extra lateral
-        correction authority from the Stanley controller.
+        correction authority from the Stanley controller, or while it
+        must decelerate safely towards an obstacle it hasn't started
+        going around yet.
 
         The Stanley lateral controller's correction term is
         `atan(K_V * lateral_error / (K_S + speed))`: for the same
@@ -1082,7 +1137,10 @@ class BehaviorAgent(BasicAgent):
         of the width it needed, by the time it reached the obstacle --
         for an in-lane nudge (`_nudge_convergence_speed`) as much as for
         the sharp diagonal at the start of a full lane change
-        (`_overtaking_transition_speed`).
+        (`_overtaking_transition_speed`). Separately, while waiting for a
+        gap (`_waiting_gap_speed`) the agent must decelerate towards the
+        obstacle it hasn't started bypassing yet, rather than cruising
+        at full manoeuvre speed until a last-resort emergency brake.
 
             :param waypoint: the agent's current waypoint
             :return: target speed in km/h
@@ -1094,6 +1152,9 @@ class BehaviorAgent(BasicAgent):
 
         if self._bypass_state == 'overtaking':
             return self._overtaking_transition_speed(waypoint, base_speed)
+
+        if self._bypass_state == 'waiting_gap':
+            return self._waiting_gap_speed(waypoint, base_speed)
 
         return base_speed
 
