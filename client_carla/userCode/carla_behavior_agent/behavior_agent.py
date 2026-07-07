@@ -66,10 +66,10 @@ class BehaviorAgent(BasicAgent):
     #     gap acceptance : _can_start_bypass, _bypass_side,              #
     #                      _right_lane_usable, _right_lane_clear,        #
     #                      _oncoming_lane_obstacle, _gap_is_safe         #
-    #     manoeuvre      : _start_bypass_maneuver, _bypass_target_       #
-    #                      waypoints, _forward_on_lane,                  #
-    #                      _resume_original_lane, _overtaking_transition_#
-    #                      speed                                        #
+    #     manoeuvre      : _start_bypass_maneuver, _build_lane_shift_path, #
+    #                      _bypass_remaining_distance, _forward_on_lane,   #
+    #                      _resume_original_lane, _overtaking_transition_  #
+    #                      speed                                          #
     #     sortie         : _obstacle_cleared, _bypass_progress_clear,    #
     #                      _back_on_original_lane, _bypass_timed_out,    #
     #                      _reset_bypass_state                          #
@@ -777,71 +777,140 @@ class BehaviorAgent(BasicAgent):
         """
         return lane_waypoint.next(distance) if same_direction else lane_waypoint.previous(distance)
 
-    def _bypass_target_waypoints(self, waypoint):
+    def _build_lane_shift_path(self, current_waypoint, target_lane_wpt, same_direction, distance):
         """
-        Resolves the two waypoints needed to start a bypass: the target
-        lane to move into (the right lane if `_bypass_side` allows it,
-        otherwise the opposite/left lane as before), and a point on that
-        same lane far enough ahead -- in our own direction of travel, see
-        `_forward_on_lane` -- to clear every obstacle currently ahead (see
-        `_farthest_obstacle_distance`), not just the closest prop. Either
-        can legitimately be missing (edge of the map, lane ending) -- this
-        must be checked before use, not assumed.
+        Builds an explicit (waypoint, RoadOption) list from the agent's
+        current position onto `target_lane_wpt`'s lane, sampled every
+        `_sampling_resolution` metres for `distance` metres further along
+        that lane IN OUR OWN DIRECTION OF TRAVEL (see `_forward_on_lane`).
+
+        Used for both legs of a full bypass (crossing onto the bypass lane
+        and crossing back) INSTEAD of a single `set_destination` end
+        location. The reason: `GlobalRoutePlanner.trace_route` picks its
+        own intermediate waypoint for a lane-change edge from the target
+        lane's topology `path` array (see `global_route_planner.py`,
+        `_build_topology`/`trace_route`), which is sampled along that
+        lane's OWN forward direction -- reversed relative to ours whenever
+        the target is the oncoming lane (the only option on a plain
+        two-way road, i.e. every `*TwoWays` scenario). That reversed
+        indexing can select a point BEHIND the agent instead of ahead of
+        it, which is why the trajectory barely deviated before running
+        straight into the obstacle: the "manoeuvre" was, geometrically,
+        barely a manoeuvre at all. Building the sequence ourselves with
+        `_forward_on_lane` (already fixed to respect our actual direction
+        of travel) sidesteps that shared-code ambiguity entirely, and
+        gives a smooth multi-waypoint path instead of a single 2-point
+        jump for the Stanley controller to track.
+
+            :param current_waypoint: the agent's current waypoint
+            :param target_lane_wpt: waypoint on the lane to shift onto
+            :param same_direction: True if that lane shares our direction
+                of travel (see `_forward_on_lane`)
+            :param distance: how far to extend the path along the target
+                lane, in our direction of travel (m)
+            :return: list of (carla.Waypoint, RoadOption), or None if the
+                     target lane doesn't extend far enough to build a path
+        """
+        path = [(current_waypoint, RoadOption.LANEFOLLOW),
+                (target_lane_wpt, RoadOption.LANEFOLLOW)]
+        travelled = 0.0
+        current = target_lane_wpt
+        while travelled < distance:
+            step = min(self._sampling_resolution, distance - travelled)
+            ahead = self._forward_on_lane(current, same_direction, step)
+            if not ahead:
+                break
+            current = ahead[0]
+            path.append((current, RoadOption.LANEFOLLOW))
+            travelled += step
+        if len(path) < 2:
+            return None
+        return path
+
+    def _bypass_remaining_distance(self, waypoint):
+        """
+        Distance still to cover, from the agent's CURRENT position, before
+        `_bypass_progress_clear` will consider the obstacle cluster
+        cleared -- i.e. the same `_bypass_reach + BYPASS_CLEAR_MARGIN`
+        threshold (measured from the manoeuvre's origin), converted into
+        "distance from here" so a manually-built path (see
+        `_build_lane_shift_path`) is guaranteed at least as long as the
+        state machine needs it to be.
+
+        Without this, sizing the path from the obstacle distance measured
+        again at manoeuvre-start time (smaller than at detection time,
+        since the agent kept approaching while waiting for a gap) could
+        produce a path shorter than `_bypass_progress_clear` needs -- the
+        local planner's queue would run dry before the state machine
+        decides the manoeuvre is done, leaving the agent braked to a
+        stop (see `LocalPlanner.run_step`: an empty queue means a full
+        brake) instead of continuing back onto the original lane.
 
             :param waypoint: the agent's current waypoint
-            :return: tuple (target_wpt, end_waypoint), either may be None
+            :return: distance in metres, floored at BYPASS_CLEAR_MARGIN
         """
-        same_direction = self._bypass_side(waypoint) == 1
-        target_wpt = waypoint.get_right_lane() if same_direction else waypoint.get_left_lane()
-        if target_wpt is None:
-            return None, None
-        reach = self._farthest_obstacle_distance(waypoint) + self.BYPASS_CLEAR_MARGIN
-        ahead = self._forward_on_lane(target_wpt, same_direction, reach)
-        end_waypoint = ahead[0] if ahead else None
-        return target_wpt, end_waypoint
+        target = self._bypass_reach + self.BYPASS_CLEAR_MARGIN
+        if self._bypass_origin_waypoint is not None:
+            travelled = waypoint.transform.location.distance(
+                self._bypass_origin_waypoint.transform.location)
+            target -= travelled
+        return max(target, self.BYPASS_CLEAR_MARGIN)
 
     def _start_bypass_maneuver(self, waypoint):
         """
         Triggers a lateral shift to the target lane (see `_bypass_side`)
-        to bypass the obstacle cluster. Calls `set_destination` with a
-        single argument (the target-lane point past the whole cluster):
-        passing a `start_location` there is not reliable -- this agent's
-        `set_destination` silently substitutes the vehicle's current
-        location for it and appends to the existing plan instead of
-        replacing it, so the shift never actually happened. With a single
-        end location on the target lane, the global route planner is
-        forced to compute a genuine lane change to reach it.
+        to bypass the obstacle cluster, using a manually-built path (see
+        `_build_lane_shift_path`) rather than `set_destination` -- see
+        that method's docstring for why.
 
             :param waypoint: the agent's current waypoint
             :return: True if the manoeuvre was actually started
         """
-        opposite_wpt, end_waypoint = self._bypass_target_waypoints(waypoint)
-        if opposite_wpt is None or end_waypoint is None:
+        same_direction = self._bypass_side(waypoint) == 1
+        target_wpt = waypoint.get_right_lane() if same_direction else waypoint.get_left_lane()
+        if target_wpt is None:
             return False
-        self.set_destination(end_waypoint.transform.location)
+        distance = self._bypass_remaining_distance(waypoint)
+        path = self._build_lane_shift_path(waypoint, target_wpt, same_direction, distance)
+        if path is None:
+            return False
+        self._local_planner.set_global_plan(path, stop_waypoint_creation=True, clean_queue=True)
         return True
 
     def _resume_original_lane(self, waypoint):
         """
-        Issues a fresh destination back on the original lane, well past the
-        cluster. Needed because `set_destination` leaves the local planner's
-        `stop_waypoint_creation` flag set: once the opposite-lane destination
-        used to bypass the cluster is reached, the planner does not
-        generate any further waypoints on its own and simply stops -- which
-        is what left the agent frozen in place after clearing the obstacle
-        instead of continuing the route.
+        Issues a manually-built path (see `_build_lane_shift_path`) back
+        onto the original lane, well past the cluster -- same rationale
+        as `_start_bypass_maneuver`, applied to the return leg (crossing
+        back has the exact same direction-ambiguity risk as crossing out,
+        since `_forward_on_lane`/`.previous` vs `.next` depends only on
+        which lane is being entered, not which leg of the manoeuvre this
+        is).
+
+        The target lane point handed to `_build_lane_shift_path` is NOT
+        `_bypass_origin_waypoint` itself: by the time the manoeuvre is
+        done, the agent has driven well past it, so using it directly
+        would build a path whose first steps point BACKWARDS (origin
+        sitting behind the agent's current position). Advancing from the
+        origin by the distance already travelled since it was captured
+        first locates a point abeam of the agent's current position on
+        the original lane -- from there, `BYPASS_RESUME_DISTANCE` extends
+        forward as intended.
 
             :param waypoint: the agent's current waypoint
-            :return: True if a new destination was set
+            :return: True if a new path was set
         """
         origin = self._bypass_origin_waypoint or waypoint
-        ahead = origin.next(self.BYPASS_RESUME_DISTANCE)
-        resume_wpt = ahead[0] if ahead else None
-        if resume_wpt is None:
+        travelled = (waypoint.transform.location.distance(origin.transform.location)
+                     if self._bypass_origin_waypoint is not None else 0.0)
+        abeam = origin.next(travelled)
+        target_lane_wpt = abeam[0] if abeam else origin
+        path = self._build_lane_shift_path(
+            waypoint, target_lane_wpt, same_direction=True, distance=self.BYPASS_RESUME_DISTANCE)
+        if path is None:
             return False
-        self.set_destination(resume_wpt.transform.location)
+        self._local_planner.set_global_plan(path, stop_waypoint_creation=True, clean_queue=True)
         return True
-
     def _obstacle_cleared(self, waypoint):
         """
         Indicates whether the obstacle that was bypassed has now been passed 
