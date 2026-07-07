@@ -19,11 +19,11 @@
 	 <position x="-3349.5" y="854.0" z="338.9"/>
   </waypoints>
   <scenarios>
-	 <!-- <scenario name="ConstructionObstacleTwoWays_1" type="ConstructionObstacleTwoWays">
+	 <scenario name="ConstructionObstacleTwoWays_1" type="ConstructionObstacleTwoWays">
 		<trigger_point x="-1291.0" y="1609.4" z="328.6" yaw="-179.5"/>
 		<distance value="80"/>
 		<frequency from="45" to="105"/>
-	 </scenario> -->
+	 </scenario>
 	 <scenario name="HazardAtSideLaneTwoWays_1" type="HazardAtSideLaneTwoWays">
 		<trigger_point x="-1474.7" y="1607.9" z="325.7" yaw="-179.5"/>
 		<distance value="70"/>
