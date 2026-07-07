@@ -65,7 +65,8 @@ class BehaviorAgent(BasicAgent):
     #                      bypass, _nudge_convergence_speed              #
     #     gap acceptance : _can_start_bypass, _bypass_side,              #
     #                      _right_lane_usable, _right_lane_clear,        #
-    #                      _oncoming_lane_obstacle, _gap_is_safe         #
+    #                      _oncoming_lane_obstacle, _vehicles_on_lane,   #
+    #                      _gap_is_safe                                 #
     #     manoeuvre      : _start_bypass_maneuver, _build_lane_shift_path, #
     #                      _bypass_remaining_distance, _forward_on_lane,   #
     #                      _resume_original_lane, _overtaking_transition_  #
@@ -495,19 +496,60 @@ class BehaviorAgent(BasicAgent):
             return static_state, static_obstacle, static_distance
         return self._stalled_vehicle_ahead(waypoint)
 
+    def _vehicles_on_lane(self, target_wpt, max_distance):
+        """
+        Vehicles actually located on `target_wpt`'s lane, matched by real
+        `road_id`/`lane_id` -- NOT by `_vehicle_obstacle_detected`'s
+        `lane_offset` arithmetic (`ego_wpt.lane_id + lane_offset`), which
+        assumes the target lane is a same-direction neighbour reached by
+        a small integer step (e.g. lane -1 -> -2 for a right lane change).
+        That assumption holds for a same-direction lane change, but not
+        for crossing to the OPPOSITE lane on a two-way road: the opposite
+        lane's id is on the other side of the sign boundary (e.g. -1 -> +1,
+        skipping 0 entirely), so `ego_wpt.lane_id - 1` never identifies it.
+        The agent then found no vehicle there regardless of what was
+        actually on that lane and treated every gap as safe -- which is
+        why it collided with an oncoming vehicle right after "Gap found":
+        the vehicle was never actually seen.
+
+            :param target_wpt: waypoint on the lane to check, or None
+            :param max_distance: search radius from the ego (m)
+            :return: list of (distance, vehicle) tuples, nearest first
+        """
+        if target_wpt is None:
+            return []
+        ego_loc = self._vehicle.get_location()
+        found = []
+        for actor in self._actors.filter("*vehicle*"):
+            if actor.id == self._vehicle.id:
+                continue
+            actor_wpt = self._map.get_waypoint(actor.get_location(), lane_type=carla.LaneType.Any)
+            if actor_wpt is None:
+                continue
+            if actor_wpt.road_id != target_wpt.road_id or actor_wpt.lane_id != target_wpt.lane_id:
+                continue
+            distance = actor.get_location().distance(ego_loc)
+            if distance < max_distance:
+                found.append((distance, actor))
+        found.sort(key=lambda item: item[0])
+        return found
+
     def _oncoming_lane_obstacle(self, waypoint):
         """
-        Detects a vehicle travelling in the opposite direction on the opposite carriageway,
-        used to search for a gap before overtaking.
+        Detects the nearest vehicle travelling on the opposite/oncoming
+        lane (the one used for a left-side bypass), for gap acceptance
+        before crossing. See `_vehicles_on_lane` for why this matches by
+        the opposite lane's real id instead of an ego-relative offset.
 
-            :param waypoint: the agent’s current waypoint
+            :param waypoint: the agent's current waypoint
             :return: tuple (vehicle_state, vehicle, distance)
         """
-        actors = self._actors.filter("*vehicle*")
-        def dist(v): return v.get_location().distance(waypoint.transform.location)
-        vehicle_list = [v for v in actors if dist(v) < self.BYPASS_DETECTION_DISTANCE and v.id != self._vehicle.id]
-        return self._vehicle_obstacle_detected(
-            vehicle_list, self.BYPASS_DETECTION_DISTANCE, up_angle_th=180, lane_offset=-1)
+        opposite_wpt = waypoint.get_left_lane()
+        found = self._vehicles_on_lane(opposite_wpt, self.BYPASS_DETECTION_DISTANCE)
+        if not found:
+            return False, None, -1
+        distance, vehicle = found[0]
+        return True, vehicle, distance
 
     def _gap_is_safe(self, oncoming_distance, oncoming_speed, min_gap_time=None):
         """
@@ -557,14 +599,18 @@ class BehaviorAgent(BasicAgent):
         """
         Checks whether the right-hand lane is free over the bypass
         detection range, so it can actually be used as an overtaking path.
+        Uses `_vehicles_on_lane` (real road_id/lane_id match) rather than
+        `_vehicle_obstacle_detected`'s ego-relative `lane_offset` for the
+        same reason as `_oncoming_lane_obstacle`: consistent, and safe
+        even on a road with more than one lane per direction where
+        `ego_wpt.lane_id + 1` might not be the specific lane
+        `_right_lane_usable` actually resolved.
 
             :param waypoint: the agent's current waypoint
-            :return: True if no obstacle occupies the right lane
+            :return: True if no vehicle occupies the right lane
         """
-        vehicle_list = self._build_obstacle_list(waypoint, max_distance=self.BYPASS_DETECTION_DISTANCE)
-        state, _, _ = self._vehicle_obstacle_detected(
-            vehicle_list, self.BYPASS_DETECTION_DISTANCE, up_angle_th=180, lane_offset=1)
-        return not state
+        right_wpt = self._right_lane_usable(waypoint)
+        return not self._vehicles_on_lane(right_wpt, self.BYPASS_DETECTION_DISTANCE)
 
     def _bypass_side(self, waypoint):
         """
