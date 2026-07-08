@@ -49,6 +49,14 @@ class BehaviorAgent(BasicAgent):
 
     BYPASS_DETECTION_DISTANCE = 80
     BYPASS_MIN_GAP_TIME = 4.0
+    BYPASS_LANE_OVERLAP_MARGIN = 0.3   # m of slack added to half the lane width when deciding whether
+                                        # a candidate obstacle's own footprint genuinely overlaps the
+                                        # driving lane (see `_is_obstacle_in_lane`) - guards against
+                                        # roadside map dressing (Town12 is procedurally generated and
+                                        # scatters plenty of `static.prop.*` clutter right at the lane
+                                        # edge) being mistaken for a real blocking obstacle just because
+                                        # CARLA's nearest-waypoint lookup (lane_type=Any) snapped its
+                                        # center onto the driving lane's lane_id.
     BYPASS_OVERTAKE_MARGIN = 8.0   # extra distance (m) travelled past the obstacle's far edge before
                                     # merging back onto the original lane - "reprise de la trajectoire
                                     # normale dès que l'obstacle est dépassé" (§3.1/§3.9) still needs a
@@ -77,8 +85,14 @@ class BehaviorAgent(BasicAgent):
     CONTROL_LOSS_DEBOUNCE_TICKS = 3         # consecutive detections required before entering 'stabilizing'
                                              # (filters out single-tick noise from hard braking / waypoint
                                              # jumps that briefly swing the velocity heading without a real skid)
-    CONTROL_LOSS_BYPASS_GRACE_TICKS = 15 
-    
+    CONTROL_LOSS_BYPASS_GRACE_TICKS = 15    # suppress control-loss detection for a short window right after
+                                             # the bypass module commands a lane change (see
+                                             # `_in_bypass_maneuver_grace_period`) - a commanded swing onto/off
+                                             # the opposite lane is not tagged CHANGELANELEFT/RIGHT (the bypass
+                                             # uses a full set_destination() replan), so without this it was
+                                             # being misread as a skid right as the manoeuvre started, stalling
+                                             # the agent in the opposite lane in front of oncoming traffic.
+
     WET_HEADING_MARGIN = 0.7   # multiplier on the heading threshold at max wetness (lower = triggers earlier)
     WET_SPEED_MARGIN = 0.7     # multiplier on the stabilize speed at max wetness (lower = more cautious)
 
@@ -118,8 +132,7 @@ class BehaviorAgent(BasicAgent):
         self._bypass_origin_waypoint = None
         self._bypass_start_tick = None
         self._last_bypass_transition_tick = None   # see `_in_bypass_maneuver_grace_period`
-        self._bypass_target_actor = None 
-
+        self._bypass_target_actor = None          
         self._actors = None
 
         self._tick_count = 0
@@ -166,7 +179,7 @@ class BehaviorAgent(BasicAgent):
         print(f"[STATE] tick={self._tick_count} pos=({loc.x:.1f}, {loc.y:.1f}, {loc.z:.1f}) "
               f"speed={self._speed:.1f} km/h")
 
-    def _log_bypass_transition(self, event, waypoint=None):
+    def _log_bypass_transition(self, event, waypoint=None, obstacle=None):
         """
         A single entry point for all messages relating to the obstacle-avoidance cycle, 
         to ensure a consistent format and to make it easy to grep the logs 
@@ -174,11 +187,15 @@ class BehaviorAgent(BasicAgent):
 
             :param event: 'detected' | 'gap_found' | 'success' | 'timeout' | 'no_lane'
             :param waypoint: the agent’s current waypoint (optional)
+            :param obstacle: the obstacle actor that triggered 'detected' (optional) - logging its
+                type_id makes it possible to tell a real scenario-spawned obstacle apart from
+                unrelated map dressing without attaching a debugger (see `_is_obstacle_in_lane`).
         """
         loc = waypoint.transform.location if waypoint is not None else None
         pos = f" pos=({loc.x:.1f}, {loc.y:.1f})" if loc is not None else ""
+        obstacle_info = f" obstacle={obstacle.type_id}(id={obstacle.id})" if obstacle is not None else ""
         messages = {
-            'detected': f"[BYPASS] Obstacle detected{pos} -> searching for a gap",
+            'detected': f"[BYPASS] Obstacle detected{pos}{obstacle_info} -> searching for a gap",
             'gap_found': f"[BYPASS] Gap found{pos} -> start of manoeuvre",
             'success': f"[BYPASS] TEST SUCCESSFUL: obstacle bypassed, back on track{pos}",
             'timeout': f"[BYPASS] TEST FAILED: manoeuvre timed out{pos}"
@@ -492,7 +509,12 @@ class BehaviorAgent(BasicAgent):
             :param waypoint: the agent's current waypoint
             :param debug: boolean for debugging
             :param ignore_actor_id: id of an actor to disregard even if
-                detected 
+                detected - used while bypassing so the agent doesn't brake
+                for the very obstacle it is deliberately steering around
+                (that obstacle stays "ahead" in the forward-detection cone
+                for a while even during a correctly-executing manoeuvre;
+                treating it as a new hazard would stall the vehicle right
+                next to it instead of actually passing it)
             :return: a carla.VehicleControl if a moving obstacle requires
                      immediate action, otherwise None (caller is free to
                      apply its own speed/route for this tick)
@@ -510,6 +532,21 @@ class BehaviorAgent(BasicAgent):
 
 #----------------------------------------------------------------------------------------------#
 
+    def _is_obstacle_in_lane(self, obstacle, waypoint):
+        """
+        True only if `obstacle`'s own footprint genuinely overlaps the
+        current driving lane - not just its center matching a nearby
+        waypoint's lane_id/road_id.
+
+            :param obstacle: the candidate obstacle actor
+            :param waypoint: the agent's current waypoint
+            :return: True if the obstacle's footprint reaches into the
+                     driving lane
+        """
+        _, lateral = self._road_projection(obstacle, waypoint)
+        obstacle_half_width = max(obstacle.bounding_box.extent.x, obstacle.bounding_box.extent.y)
+        return (abs(lateral) - obstacle_half_width) < (waypoint.lane_width / 2.0 + self.BYPASS_LANE_OVERLAP_MARGIN)
+
     def _static_obstacle_ahead(self, waypoint):
         """
         Detects a static obstacle (roadworks, accident, parked vehicle)
@@ -520,8 +557,11 @@ class BehaviorAgent(BasicAgent):
         """
         obstacle_list = self._build_obstacle_list(waypoint, max_distance=self.BYPASS_DETECTION_DISTANCE)
         static_list = [o for o in obstacle_list if "static.prop" in o.type_id]
-        return self._vehicle_obstacle_detected(
+        obstacle_state, obstacle, distance = self._vehicle_obstacle_detected(
             static_list, self.BYPASS_DETECTION_DISTANCE, up_angle_th=self.FORWARD_ANGLE_STRAIGHT)
+        if obstacle_state and not self._is_obstacle_in_lane(obstacle, waypoint):
+            return False, None, -1
+        return obstacle_state, obstacle, distance
 
     def _update_stall_tracking(self, vehicle):
         """
@@ -564,7 +604,8 @@ class BehaviorAgent(BasicAgent):
             obstacle_list, self.BYPASS_DETECTION_DISTANCE, up_angle_th=self.FORWARD_ANGLE_STRAIGHT)
 
         self._update_stall_tracking(vehicle if vehicle_state else None)
-        if vehicle_state and self._stalled_vehicle_confirmed():
+        if (vehicle_state and self._stalled_vehicle_confirmed()
+                and self._is_obstacle_in_lane(vehicle, waypoint)):
             return True, vehicle, distance
         return False, None, -1
 
@@ -738,13 +779,13 @@ class BehaviorAgent(BasicAgent):
                      destination rather than applying the normal behaviour)
         """
         if self._bypass_state == 'idle':
-            obstacle_state, _, _ = self._blocking_obstacle_ahead(waypoint)
+            obstacle_state, obstacle, _ = self._blocking_obstacle_ahead(waypoint)
             if obstacle_state:
                 self._bypass_origin_waypoint = waypoint
                 self._bypass_state = 'waiting_gap'
                 self._bypass_start_tick = self._tick_count
                 self._last_bypass_transition_tick = self._tick_count
-                self._log_bypass_transition('detected', waypoint)
+                self._log_bypass_transition('detected', waypoint, obstacle=obstacle)
             return self._bypass_state != 'idle'
 
         if self._bypass_timed_out():
