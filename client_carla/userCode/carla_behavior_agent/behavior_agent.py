@@ -35,64 +35,26 @@ class BehaviorAgent(BasicAgent):
     FORWARD_ANGLE_STRAIGHT = 30
     FORWARD_ANGLE_TURN = 60
 
-    # Dynamic safety margin (Route1_Plan_Strategie_Obstacles.md §3.2/§4.1:
-    # "prévoir une marge de sécurité dynamique plutôt qu'une distance fixe").
-    # A detection/braking distance tied only to the speed limit or a fixed
-    # meter value gives less real reaction TIME as cruising speed rises -
-    # this is what let the agent close on slow-moving cyclists faster than
-    # it could react/brake. These add a speed-proportional margin (in
-    # seconds of travel) on top of the existing static base values.
-    DETECTION_SPEED_MARGIN_SECONDS = 2.5   # extra forward detection range, in seconds of travel
-    BRAKING_SPEED_MARGIN_SECONDS = 0.8     # extra emergency-stop trigger distance, in seconds of travel
+    DETECTION_SPEED_MARGIN_SECONDS = 2.5 
+    BRAKING_SPEED_MARGIN_SECONDS = 0.8
 
-    LATERAL_HAZARD_HALF_WIDTH = 3.0   # m either side of the lane centerline still considered a hazard
+    LATERAL_HAZARD_HALF_WIDTH = 3.0
 
-    # Overtake trigger (user request, cf. Route1_Plan_Strategie_Obstacles.md):
-    # a lane-change bypass must ONLY be attempted for (1) a static obstacle,
-    # (2) a cyclist ahead or beside, or (3) a vehicle confirmed genuinely
-    # stalled (not just paused for a stop sign/red light/pulling away) -
-    # never as a default reaction to "there is something in front of me"
-    # (that default case is car-following, see `car_following_manager`).
     CYCLIST_TYPE_KEYWORDS = (
         'vehicle.bh.crossbike',
         'vehicle.diamondback.century',
         'vehicle.gazelle.omafiets',
-    )  # the CARLA bike blueprints - a cyclist is a `vehicle`-type actor, not
-       # a `walker.pedestrian` one, see Route1_Plan_Strategie_Obstacles.md §6.2
+    )
 
-    JUNCTION_STALL_EXCLUSION_DISTANCE = 25.0   # m - a vehicle stopped at/within this
-                                                 # distance of a junction is never classified
-                                                 # as "stalled", however long it waits: this is
-                                                 # a stop sign, a red light, or the first seconds
-                                                 # of pulling away from either, not a breakdown.
+    JUNCTION_STALL_EXCLUSION_DISTANCE = 25.0   
 
     BYPASS_DETECTION_DISTANCE = 80
     BYPASS_MIN_GAP_TIME = 4.0
-    BYPASS_LANE_OVERLAP_MARGIN = 0.3   # m of slack added to half the lane width when deciding whether
-                                        # a candidate obstacle's own footprint genuinely overlaps the
-                                        # driving lane (see `_is_obstacle_in_lane`) - guards against
-                                        # roadside map dressing (Town12 is procedurally generated and
-                                        # scatters plenty of `static.prop.*` clutter right at the lane
-                                        # edge) being mistaken for a real blocking obstacle just because
-                                        # CARLA's nearest-waypoint lookup (lane_type=Any) snapped its
-                                        # center onto the driving lane's lane_id.
-    BYPASS_OVERTAKE_MARGIN = 8.0   # extra distance (m) travelled past the obstacle's far edge before
-                                    # merging back onto the original lane - "reprise de la trajectoire
-                                    # normale dès que l'obstacle est dépassé" (§3.1/§3.9) still needs a
-                                    # small safety margin, not an instant cut-back right beside it.
+    BYPASS_LANE_OVERLAP_MARGIN = 0.3   
+    BYPASS_OVERTAKE_MARGIN = 8.0  
 
-    BYPASS_ABORT_RESUME_SPEED_THRESHOLD = 8.0   # km/h - well above STALL_SPEED_THRESHOLD (1.0): if the
-                                                  # vehicle being bypassed sustains a real driving speed
-                                                  # DURING the 'overtaking' phase, it was never genuinely
-                                                  # stalled - just an ordinary lead vehicle that paused
-                                                  # briefly (queue, TM not having released it yet...) and
-                                                  # got misclassified as a permanent obstacle (AccidentTwoWays).
-                                                  # Chasing a vehicle that is simply driving normally is
-                                                  # exactly "suivre un véhicule", not overtaking a blockage.
-    BYPASS_ABORT_RESUME_TICKS = 40   # ~2s at 20 FPS of sustained normal speed before aborting the
-                                       # manoeuvre - long enough to ignore a single-tick noise blip,
-                                       # short enough to bail out well before BYPASS_TIMEOUT_TICKS (800)
-                                       # instead of dragging the failure out to a full scenario timeout.
+    BYPASS_ABORT_RESUME_SPEED_THRESHOLD = 8.0   
+    BYPASS_ABORT_RESUME_TICKS = 40   
 
     STATE_LOG_INTERVAL = 20
     BYPASS_TIMEOUT_TICKS = 800
@@ -101,72 +63,31 @@ class BehaviorAgent(BasicAgent):
     JUNCTION_MIN_GAP_TIME = 3.0
     JUNCTION_TIMEOUT_TICKS = 300
 
-    STALL_SPEED_THRESHOLD = 1.0    # km/h, considered "not moving"
-    STALL_TIMEOUT_TICKS = 150      # ~7.5s at 20 FPS before it's confirmed stalled
-                                    # (long enough not to mistake a stop-sign/queue pause for a wreck)
-    EGO_BLOCKED_SPEED_THRESHOLD = 2.0    # km/h, ego itself considered "not moving"
+    STALL_SPEED_THRESHOLD = 1.0    
+    STALL_TIMEOUT_TICKS = 150      
+    EGO_BLOCKED_SPEED_THRESHOLD = 2.0    
     EGO_BLOCKED_CONFIRM_TICKS = 100 
     BYPASS_MAX_CONSECUTIVE_RETRIES = 2
-    BYPASS_GIVEUP_COOLDOWN_TICKS = 300   # ~15s at 20 FPS - after giving up on an actor (see
-                                           # `_record_bypass_failure`), the agent stops trying to
-                                           # bypass it for this long, then reconsiders. A PERMANENT
-                                           # blacklist (the previous behaviour) is only safe for the
-                                           # exact failure mode it targets - endlessly re-chasing an
-                                           # ordinary moving vehicle - but the same actor can later
-                                           # become a genuine, permanent blockage (e.g. a cyclist that
-                                           # finishes its scripted path and stops for good in the
-                                           # lane): with no cooldown, the agent would then fall back
-                                           # to plain car-following/emergency-stop against it forever,
-                                           # since it would never be allowed to attempt a bypass again
-                                           # (observed: RouteCompletionTest stuck at ~12% after a
-                                           # legitimate HazardAtSideLaneTwoWays bypass timed out).
+    BYPASS_GIVEUP_COOLDOWN_TICKS = 300   
 
-    STALL_MIN_EGO_MOVED_SPEED_KMH = 10.0   # km/h - clearly above EGO_BLOCKED_SPEED_THRESHOLD (2.0):
-                                             # once ego has been observed going at least this fast
-                                             # ONCE since the start of the episode, it has proven it
-                                             # is capable of normal driving - any later stand-still
-                                             # behind a vehicle is then a genuine blockage, not launch
-                                             # inertia. Kept as a one-way latch (see
-                                             # `_ego_has_moved_normally`) rather than a fixed tick
-                                             # count: a fixed duration guesses how long spawn-in
-                                             # acceleration takes, which varies with CARLA/traffic
-                                             # conditions, whereas "has it ever actually driven yet"
-                                             # adapts automatically to however long that really takes.
-    STALL_STARTUP_HARD_BLOCK_TICKS = 400   # ~20s - safety net for the (unlikely on this route, but
-                                             # possible in general) case where a real obstacle sits
-                                             # right at the route's very first waypoint: if ego has
-                                             # been blocked this long WITHOUT ever having proven it can
-                                             # move, treat it as a genuine blockage anyway rather than
-                                             # waiting on `_ego_has_moved_normally` forever.
-    STALL_STARTUP_GRACE_TICKS = 200   # ~10s at 20 FPS - secondary, purely time-based gate on top of
-                                        # `_ego_has_moved_normally`: even once ego has proven it can
-                                        # drive normally, still ignore stall confirmations for this
-                                        # long since episode start, in case that first burst of normal
-                                        # speed was itself a fluke (e.g. a brief gap before merging
-                                        # back behind the very vehicle now being tracked).
+    STALL_MIN_EGO_MOVED_SPEED_KMH = 10.0   
+    STALL_STARTUP_HARD_BLOCK_TICKS = 400   
+    STALL_STARTUP_GRACE_TICKS = 200   
 
-    PEDESTRIAN_WAIT_TIMEOUT_TICKS = 200   # ~10s at 20 FPS before creeping past
-    PEDESTRIAN_STATIONARY_SPEED = 0.5     # km/h, considered "not walking"
-    PEDESTRIAN_CREEP_SPEED = 5            # km/h, cautious speed once timed out
+    PEDESTRIAN_WAIT_TIMEOUT_TICKS = 200   
+    PEDESTRIAN_STATIONARY_SPEED = 0.5     
+    PEDESTRIAN_CREEP_SPEED = 5            
 
-    CONTROL_LOSS_HEADING_THRESHOLD = 25.0   # deg, uncommanded deviation that triggers stabilization
-    CONTROL_LOSS_RECOVERY_THRESHOLD = 8.0   # deg, hysteresis: must fall back below this to be "recovered"
-    CONTROL_LOSS_MIN_SPEED_KMH = 5.0        # below this, heading is too noisy to mean anything
-    CONTROL_LOSS_STABILIZE_SPEED = 20.0     # km/h, cautious creep while correcting (throttle only, no hard brake)
-    CONTROL_LOSS_TIMEOUT_TICKS = 400        # safety net: a stuck sensor reading can't cap speed forever
-    CONTROL_LOSS_DEBOUNCE_TICKS = 3         # consecutive detections required before entering 'stabilizing'
-                                             # (filters out single-tick noise from hard braking / waypoint
-                                             # jumps that briefly swing the velocity heading without a real skid)
-    CONTROL_LOSS_BYPASS_GRACE_TICKS = 15    # suppress control-loss detection for a short window right after
-                                             # the bypass module commands a lane change (see
-                                             # `_in_bypass_maneuver_grace_period`) - a commanded swing onto/off
-                                             # the opposite lane is not tagged CHANGELANELEFT/RIGHT (the bypass
-                                             # uses a full set_destination() replan), so without this it was
-                                             # being misread as a skid right as the manoeuvre started, stalling
-                                             # the agent in the opposite lane in front of oncoming traffic.
+    CONTROL_LOSS_HEADING_THRESHOLD = 25.0  
+    CONTROL_LOSS_RECOVERY_THRESHOLD = 8.0   
+    CONTROL_LOSS_MIN_SPEED_KMH = 5.0        
+    CONTROL_LOSS_STABILIZE_SPEED = 20.0     
+    CONTROL_LOSS_TIMEOUT_TICKS = 400        
+    CONTROL_LOSS_DEBOUNCE_TICKS = 3
+    CONTROL_LOSS_BYPASS_GRACE_TICKS = 15
 
-    WET_HEADING_MARGIN = 0.7   # multiplier on the heading threshold at max wetness (lower = triggers earlier)
-    WET_SPEED_MARGIN = 0.7     # multiplier on the stabilize speed at max wetness (lower = more cautious)
+    WET_HEADING_MARGIN = 0.7
+    WET_SPEED_MARGIN = 0.7
 
     def __init__(self, vehicle, behavior='normal', opt_dict={}, map_inst=None, grp_inst=None):
         """
@@ -713,6 +634,56 @@ class BehaviorAgent(BasicAgent):
         obstacle_list = self._build_obstacle_list(waypoint, max_distance=self.BYPASS_DETECTION_DISTANCE)
         return any(a.id == actor.id for a in obstacle_list)
 
+    def _bypass_target_is_stalled_vehicle(self):
+        """
+        True only if the memorized bypass target is a genuine stalled
+        *vehicle* (AccidentTwoWays / broken-down car), as opposed to a
+        static prop (ConstructionObstacleTwoWays / ParkedObstacleTwoWays
+        blocker) or a cyclist (HazardAtSideLaneTwoWays). This distinction
+        matters because only this category is expected to stay motionless:
+        a static prop can never drive off, and a cyclist is deliberately
+        overtaken *while* it moves slowly - so any speed-based "it started
+        driving again" abort must apply to this category ONLY, never to the
+        other two.
+
+            :return: True if the current target is a stalled-type vehicle
+        """
+        actor = self._bypass_target_actor
+        if actor is None:
+            return False
+        if "static.prop" in actor.type_id:
+            return False
+        if self._is_cyclist(actor):
+            return False
+        return True
+
+    def _bypass_target_resumed_before_start(self):
+        """
+        Instantaneous re-validation used in the 'waiting_gap' phase, right
+        before committing to the lane change: True if the tracked target is
+        a stalled-type vehicle (see `_bypass_target_is_stalled_vehicle`)
+        that is now rolling again above `STALL_SPEED_THRESHOLD`.
+
+        The bypass was justified by that vehicle being *confirmed stalled*;
+        if it has since started moving, that premise is gone and the agent
+        must NOT pull out into the opposite lane. Otherwise an ordinary lead
+        car that merely paused for a few seconds (a queue, dense traffic, a
+        scenario-induced hard brake...) gets overtaken the very instant it
+        pulls away - exactly the "incoherent overtake" symptom. This is the
+        cheapest possible abort: it happens before any lateral move, so
+        reverting to plain car-following costs nothing.
+
+        Complements `_bypass_target_resumed_normal_driving`, which only
+        kicks in *after* the lane change has begun (the 'overtaking' phase).
+
+            :return: True if the manoeuvre should be aborted before it starts
+        """
+        if not self._bypass_target_is_stalled_vehicle():
+            return False
+        if not self._bypass_target_actor.is_alive:
+            return False
+        return get_speed(self._bypass_target_actor) > self.STALL_SPEED_THRESHOLD
+
     def _static_obstacle_ahead(self, waypoint):
         """
         Detects a static obstacle (roadworks, accident, parked vehicle)
@@ -755,6 +726,14 @@ class BehaviorAgent(BasicAgent):
             self._stalled_vehicle_id = vehicle.id
             self._stalled_tick_counter = 0
             self._ego_blocked_tick_counter = 0
+            # A brand-new tracked vehicle starts fresh at 0 ticks: it must be
+            # observed stationary for at least one full SUBSEQUENT tick before
+            # any counting begins, rather than being credited a stall tick on
+            # the very tick it is first seen. Without this early return, the
+            # first sighting of any near-zero-speed vehicle immediately scored
+            # tick 1 - an off-by-one that muddles "just spotted, not yet
+            # observed over time" with "confirmed stationary long enough".
+            return
 
         self._stalled_tick_counter += 1
         if self._speed <= self.EGO_BLOCKED_SPEED_THRESHOLD:
@@ -979,12 +958,46 @@ class BehaviorAgent(BasicAgent):
         self._bypass_target_actor = obstacle
         return True
 
+    def _ego_longitudinal_offset(self, actor):
+        """
+        Signed distance of `actor` ahead of (>0) or behind (<0) the ego,
+        measured along the ego's OWN current forward vector rather than the
+        road frame at a waypoint.
+
+        `_road_projection` uses the heading of the ego's current road
+        waypoint as its longitudinal axis. On a sharply curved road (and
+        Town12 is very sinuous) that axis rotates every tick, so an obstacle
+        the ego has physically driven past can still project to a positive
+        "longitudinal" value and never read as "behind" - which is exactly
+        why a cyclist overtake could hang until `BYPASS_TIMEOUT_TICKS`.
+        Projecting onto the ego's actual forward vector instead ties the
+        ahead/behind test to where the car is really pointing, independent
+        of how the lane curves, so "I have passed it" is detected reliably
+        even in the middle of a bend.
+
+            :param actor: the actor to locate relative to the ego
+            :return: longitudinal offset in metres (positive = ahead of ego)
+        """
+        ego_tf = self._vehicle.get_transform()
+        forward = ego_tf.get_forward_vector()
+        loc = actor.get_location()
+        dx = loc.x - ego_tf.location.x
+        dy = loc.y - ego_tf.location.y
+        return dx * forward.x + dy * forward.y
+
     def _obstacle_cleared(self, waypoint):
         """
-        Indicates whether the SPECIFIC obstacle being bypassed has now
-        been passed, using its geometric position relative to the agent
-        (`_road_projection`) rather than re-running the same forward
-        scanner used to detect it in the first place.
+        Indicates whether the SPECIFIC obstacle being bypassed has now been
+        passed, using its geometric position relative to the agent rather
+        than re-running the same forward scanner used to detect it.
+
+        The ahead/behind test is taken along the ego's actual heading (see
+        `_ego_longitudinal_offset`) rather than the ego's current road
+        waypoint frame: on a curved road the waypoint frame rotates each
+        tick, which could keep a physically-passed obstacle reading as
+        "still ahead" and hang the manoeuvre until it timed out. A
+        `CLEAR_MARGIN` past zero avoids merging back while the obstacle is
+        still level with the ego.
 
             :param waypoint: the agent's current waypoint
             :return: True if the tracked obstacle is now behind the agent
@@ -992,8 +1005,8 @@ class BehaviorAgent(BasicAgent):
         if self._bypass_target_actor is None:
             obstacle_state, _, _ = self._blocking_obstacle_ahead(waypoint)
             return not obstacle_state
-        longitudinal, _ = self._road_projection(self._bypass_target_actor, waypoint)
-        return longitudinal < 0
+        CLEAR_MARGIN = 5.0
+        return self._ego_longitudinal_offset(self._bypass_target_actor) < -CLEAR_MARGIN
 
     def _update_bypass_target_resumed_tracking(self):
         """
@@ -1132,20 +1145,50 @@ class BehaviorAgent(BasicAgent):
             return False
 
         if self._bypass_state == 'waiting_gap':
+            # Re-validate the memorized target BEFORE committing to the lane
+            # change: if the vehicle we confirmed stalled has started rolling
+            # again while we waited for a gap, the reason for overtaking is
+            # gone. Abort now, before any lateral move, and revert to plain
+            # car-following. Not flagged as a scenario failure (correct
+            # self-diagnosis) and NOT fed to the give-up circuit-breaker: no
+            # manoeuvre was wasted, and a genuine re-stall later still takes
+            # a full STALL_TIMEOUT_TICKS to re-confirm, so this can't loop.
+            if self._bypass_target_resumed_before_start():
+                self._log_bypass_transition('resumed_normal', waypoint, obstacle=self._bypass_target_actor)
+                self._reset_bypass_state()
+                return False
+
             if self._can_start_bypass(waypoint):
-                obstacle_state, obstacle, obstacle_distance = self._blocking_obstacle_ahead(waypoint)
-                if not obstacle_state:
+
+                obstacle = self._bypass_target_actor
+
+                if obstacle is None or not obstacle.is_alive:
                     self._reset_bypass_state()
                     return False
-                if self._start_bypass_maneuver(waypoint, obstacle, obstacle_distance):
-                    self._bypass_state = 'overtaking'
+
+                longitudinal, _ = self._road_projection(obstacle, waypoint)
+
+                if longitudinal <= 0:
+                    self._reset_bypass_state()
+                    return False
+
+                obstacle_distance = longitudinal
+
+                if self._start_bypass_maneuver(
+                        waypoint,
+                        obstacle,
+                        obstacle_distance):
+
+                    self._bypass_state = "overtaking"
                     self._last_bypass_transition_tick = self._tick_count
-                    self._log_bypass_transition('gap_found', waypoint)
+                    self._log_bypass_transition("gap_found", waypoint)
+
                 else:
-                    self._log_bypass_transition('no_lane', waypoint)
+                    self._log_bypass_transition("no_lane", waypoint)
                     self._record_bypass_failure(obstacle)
                     self._reset_bypass_state()
                     return False
+
             return True
 
         if self._bypass_state == 'overtaking':
