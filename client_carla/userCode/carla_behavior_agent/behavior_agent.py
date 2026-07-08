@@ -72,6 +72,9 @@ class BehaviorAgent(BasicAgent):
     STALL_SPEED_THRESHOLD = 1.0    # km/h, considered "not moving"
     STALL_TIMEOUT_TICKS = 150      # ~7.5s at 20 FPS before it's confirmed stalled
                                     # (long enough not to mistake a stop-sign/queue pause for a wreck)
+    EGO_BLOCKED_SPEED_THRESHOLD = 2.0    # km/h, ego itself considered "not moving"
+    EGO_BLOCKED_CONFIRM_TICKS = 100 
+    BYPASS_MAX_CONSECUTIVE_RETRIES = 2
 
     PEDESTRIAN_WAIT_TIMEOUT_TICKS = 200   # ~10s at 20 FPS before creeping past
     PEDESTRIAN_STATIONARY_SPEED = 0.5     # km/h, considered "not walking"
@@ -132,7 +135,8 @@ class BehaviorAgent(BasicAgent):
         self._bypass_origin_waypoint = None
         self._bypass_start_tick = None
         self._last_bypass_transition_tick = None   # see `_in_bypass_maneuver_grace_period`
-        self._bypass_target_actor = None          
+        self._bypass_target_actor = None       
+
         self._actors = None
 
         self._tick_count = 0
@@ -145,6 +149,11 @@ class BehaviorAgent(BasicAgent):
         # Stalled-vehicle tracking (see STALL_TIMEOUT_TICKS)
         self._stalled_vehicle_id = None
         self._stalled_tick_counter = 0
+        self._ego_blocked_tick_counter = 0  
+
+        self._bypass_giveup_id = None
+        self._last_bypass_failed_id = None
+        self._bypass_retry_count = 0
 
         # Pedestrian wait tracking (see PEDESTRIAN_WAIT_TIMEOUT_TICKS)
         self._pedestrian_wait_id = None
@@ -566,28 +575,42 @@ class BehaviorAgent(BasicAgent):
     def _update_stall_tracking(self, vehicle):
         """
         Tracks how long a specific vehicle ahead has been reporting
-        near-zero speed. Distinguishes a genuinely stalled/wrecked vehicle
-        (AccidentTwoWays) from one only briefly stopped (queue, stop sign).
+        near-zero speed, AND how long ego itself has also been essentially
+        stationary while that vehicle is tracked. Both are required to
+        distinguish a genuinely stalled/wrecked vehicle (AccidentTwoWays)
+        from an ordinary lead vehicle that's simply queued in traffic (or
+        hasn't been released by the traffic manager yet) while ego is
+        still comfortably cruising or crawling forward behind it - that
+        case is normal car-following territory, not a permanent blockage.
 
             :param vehicle: the vehicle currently detected ahead, or None
         """
         if vehicle is None or get_speed(vehicle) > self.STALL_SPEED_THRESHOLD:
             self._stalled_vehicle_id = None
             self._stalled_tick_counter = 0
+            self._ego_blocked_tick_counter = 0
             return
 
         if vehicle.id != self._stalled_vehicle_id:
             self._stalled_vehicle_id = vehicle.id
             self._stalled_tick_counter = 0
+            self._ego_blocked_tick_counter = 0
 
         self._stalled_tick_counter += 1
+        if self._speed <= self.EGO_BLOCKED_SPEED_THRESHOLD:
+            self._ego_blocked_tick_counter += 1
+        else:
+            self._ego_blocked_tick_counter = 0
 
     def _stalled_vehicle_confirmed(self):
         """
         :return: True once the currently tracked vehicle has been
-            stationary long enough to be treated as a permanent obstacle.
+            stationary long enough, AND ego has itself been essentially
+            stopped directly behind it for long enough, to be treated as
+            a permanent obstacle worth a lane departure.
         """
-        return self._stalled_tick_counter > self.STALL_TIMEOUT_TICKS
+        return (self._stalled_tick_counter > self.STALL_TIMEOUT_TICKS
+                and self._ego_blocked_tick_counter > self.EGO_BLOCKED_CONFIRM_TICKS)
 
     def _stalled_vehicle_ahead(self, waypoint):
         """
@@ -690,8 +713,7 @@ class BehaviorAgent(BasicAgent):
     def _bypass_merge_point(self, waypoint, obstacle, obstacle_distance):
         """
         Waypoint, on the ORIGINAL lane, far enough past the obstacle to
-        safely merge back: the obstacle's own distance and length, plus a
-        safety margin.
+        safely merge back.
 
             :param waypoint: the agent's current waypoint
             :param obstacle: the obstacle actor being bypassed
@@ -757,8 +779,41 @@ class BehaviorAgent(BasicAgent):
         return (self._bypass_origin_waypoint is not None
                 and waypoint.lane_id == self._bypass_origin_waypoint.lane_id)
 
+    def _record_bypass_failure(self, obstacle):
+        """
+        Tracks consecutive bypass failures (timeout / no usable opposite
+        lane) against the SAME obstacle actor. A genuinely bypassable
+        obstacle (a real ConstructionObstacleTwoWays/AccidentTwoWays/
+        ParkedObstacleTwoWays) normally succeeds within one or two
+        attempts; looping forever against the very same actor is a sign
+        this was never a real, passable blockage - most likely an
+        ordinary vehicle we are simply following (`_stalled_vehicle_confirmed`
+        should now catch most of those, but this is a defensive backstop),
+        or a face-off deadlock our own manoeuvre created with it. Once the
+        retry budget is exhausted we give up on that specific actor for
+        the rest of the episode (see `bypass_obstacle_manager`) and fall
+        back to plain car-following instead of retrying indefinitely.
+
+            :param obstacle: the obstacle actor the failed attempt was
+                against, or None
+        """
+        obstacle_id = obstacle.id if obstacle is not None else None
+        if obstacle_id != self._last_bypass_failed_id:
+            self._last_bypass_failed_id = obstacle_id
+            self._bypass_retry_count = 0
+        self._bypass_retry_count += 1
+        if obstacle_id is not None and self._bypass_retry_count > self.BYPASS_MAX_CONSECUTIVE_RETRIES:
+            self._bypass_giveup_id = obstacle_id
+            print(f"[BYPASS] Giving up on obstacle id={obstacle_id} after "
+                  f"{self._bypass_retry_count} failed attempts -> reverting to car-following")
+
     def _reset_bypass_state(self):
-        """Resets the status of the bypass module."""
+        """
+        Resets the status of the bypass module. Deliberately leaves the
+        retry circuit-breaker bookkeeping (`_bypass_giveup_id`,
+        `_last_bypass_failed_id`, `_bypass_retry_count`) untouched - see
+        `_record_bypass_failure`.
+        """
         self._bypass_state = 'idle'
         self._bypass_origin_waypoint = None
         self._bypass_start_tick = None
@@ -766,6 +821,7 @@ class BehaviorAgent(BasicAgent):
         self._bypass_target_actor = None
         self._stalled_vehicle_id = None
         self._stalled_tick_counter = 0
+        self._ego_blocked_tick_counter = 0
 
     def bypass_obstacle_manager(self, waypoint):
         """
@@ -780,8 +836,11 @@ class BehaviorAgent(BasicAgent):
         """
         if self._bypass_state == 'idle':
             obstacle_state, obstacle, _ = self._blocking_obstacle_ahead(waypoint)
+            if obstacle_state and obstacle.id == self._bypass_giveup_id:
+                obstacle_state = False
             if obstacle_state:
                 self._bypass_origin_waypoint = waypoint
+                self._bypass_target_actor = obstacle
                 self._bypass_state = 'waiting_gap'
                 self._bypass_start_tick = self._tick_count
                 self._last_bypass_transition_tick = self._tick_count
@@ -790,6 +849,7 @@ class BehaviorAgent(BasicAgent):
 
         if self._bypass_timed_out():
             self._log_bypass_transition('timeout', waypoint)
+            self._record_bypass_failure(self._bypass_target_actor)
             self._reset_bypass_state()
             return False
 
@@ -805,6 +865,7 @@ class BehaviorAgent(BasicAgent):
                     self._log_bypass_transition('gap_found', waypoint)
                 else:
                     self._log_bypass_transition('no_lane', waypoint)
+                    self._record_bypass_failure(obstacle)
                     self._reset_bypass_state()
                     return False
             return True
