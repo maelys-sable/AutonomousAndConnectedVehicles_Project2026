@@ -73,6 +73,7 @@ class BehaviorAgent(BasicAgent):
     CONTROL_LOSS_DEBOUNCE_TICKS = 3         # consecutive detections required before entering 'stabilizing'
                                              # (filters out single-tick noise from hard braking / waypoint
                                              # jumps that briefly swing the velocity heading without a real skid)
+    CONTROL_LOSS_BYPASS_GRACE_TICKS = 15    
 
     WET_HEADING_MARGIN = 0.7   # multiplier on the heading threshold at max wetness (lower = triggers earlier)
     WET_SPEED_MARGIN = 0.7     # multiplier on the stabilize speed at max wetness (lower = more cautious)
@@ -112,6 +113,7 @@ class BehaviorAgent(BasicAgent):
         self._bypass_state = 'idle'
         self._bypass_origin_waypoint = None
         self._bypass_start_tick = None
+        self._last_bypass_transition_tick = None   # see `_in_bypass_maneuver_grace_period`
 
         self._actors = None
 
@@ -460,6 +462,48 @@ class BehaviorAgent(BasicAgent):
 
         return vehicle_state, vehicle, distance
 
+    def _bbox_adjusted_distance(self, actor, distance):
+        """
+        Converts a center-to-center distance into an edge-to-edge one using
+        both actors' bounding boxes. Factored out of `run_step` so the same
+        correction (previously only applied to the plain car-following
+        path) is applied consistently everywhere a moving-obstacle distance
+        is compared against `_effective_braking_distance()`.
+
+            :param actor: the detected obstacle
+            :param distance: raw center-to-center distance (m)
+            :return: distance adjusted for both bounding boxes (m)
+        """
+        return distance - max(
+            actor.bounding_box.extent.y, actor.bounding_box.extent.x) - max(
+                self._vehicle.bounding_box.extent.y, self._vehicle.bounding_box.extent.x)
+
+    def _react_to_moving_obstacle(self, waypoint, debug=False):
+        """
+        Runs the moving-obstacle check (`collision_and_car_avoid_manager`)
+        and, if something is within braking range, returns the control to
+        apply (emergency stop or car-following) right away.
+
+        This exists so that manoeuvres which used to short-circuit straight
+        to a cruise-speed control - the static-obstacle bypass and the
+        pedestrian creep-past - stay covered by moving-obstacle detection
+        instead of driving blind.
+
+            :param waypoint: the agent's current waypoint
+            :param debug: boolean for debugging
+            :return: a carla.VehicleControl if a moving obstacle requires
+                     immediate action, otherwise None (caller is free to
+                     apply its own speed/route for this tick)
+        """
+        vehicle_state, vehicle, distance = self.collision_and_car_avoid_manager(waypoint)
+        if not vehicle_state:
+            return None
+
+        distance = self._bbox_adjusted_distance(vehicle, distance)
+        if distance < self._effective_braking_distance():
+            return self.emergency_stop()
+        return self.car_following_manager(vehicle, distance, debug=debug)
+
 #----------------------------------------------------------------------------------------------#
 
     def _static_obstacle_ahead(self, waypoint):
@@ -632,6 +676,7 @@ class BehaviorAgent(BasicAgent):
         self._bypass_state = 'idle'
         self._bypass_origin_waypoint = None
         self._bypass_start_tick = None
+        self._last_bypass_transition_tick = None
         self._stalled_vehicle_id = None
         self._stalled_tick_counter = 0
 
@@ -652,6 +697,7 @@ class BehaviorAgent(BasicAgent):
                 self._bypass_origin_waypoint = waypoint
                 self._bypass_state = 'waiting_gap'
                 self._bypass_start_tick = self._tick_count
+                self._last_bypass_transition_tick = self._tick_count
                 self._log_bypass_transition('detected', waypoint)
             return self._bypass_state != 'idle'
 
@@ -664,6 +710,7 @@ class BehaviorAgent(BasicAgent):
             if self._can_start_bypass(waypoint):
                 if self._start_bypass_maneuver(waypoint):
                     self._bypass_state = 'overtaking'
+                    self._last_bypass_transition_tick = self._tick_count
                     self._log_bypass_transition('gap_found', waypoint)
                 else:
                     self._log_bypass_transition('no_lane', waypoint)
@@ -674,6 +721,7 @@ class BehaviorAgent(BasicAgent):
         if self._bypass_state == 'overtaking':
             if self._obstacle_cleared(waypoint):
                 self._bypass_state = 'returning'
+                self._last_bypass_transition_tick = self._tick_count
             return True
 
         if self._bypass_state == 'returning':
@@ -991,6 +1039,18 @@ class BehaviorAgent(BasicAgent):
         margin = 1.0 - (1.0 - self.WET_SPEED_MARGIN) * severity
         return self.CONTROL_LOSS_STABILIZE_SPEED * margin
 
+    def _in_bypass_maneuver_grace_period(self):
+        """
+        True for a short window right after the bypass module has just
+        commanded a lane change (`_start_bypass_maneuver`, or the
+        'overtaking' -> 'returning' transition back to the original lane).
+
+            :return: True if control-loss detection should be suppressed
+        """
+        if self._bypass_state == 'idle' or self._last_bypass_transition_tick is None:
+            return False
+        return (self._tick_count - self._last_bypass_transition_tick) <= self.CONTROL_LOSS_BYPASS_GRACE_TICKS
+
     def _control_loss_detected(self, waypoint):
         """
         :param waypoint: the agent's current waypoint
@@ -1005,6 +1065,8 @@ class BehaviorAgent(BasicAgent):
             the agent to lose the bypass in progress and drift off-road).
         """
         if self._direction in (RoadOption.CHANGELANELEFT, RoadOption.CHANGELANERIGHT):
+            return False
+        if self._in_bypass_maneuver_grace_period():
             return False
         if self._speed < self.CONTROL_LOSS_MIN_SPEED_KMH:
             return False
@@ -1198,6 +1260,9 @@ class BehaviorAgent(BasicAgent):
                 self._update_pedestrian_wait_tracking(walker)
                 if self._pedestrian_wait_timed_out() and self._pedestrian_is_stationary(walker):
                     self._log_pedestrian_wait_timeout(ego_vehicle_wp)
+                    blocking_control = self._react_to_moving_obstacle(ego_vehicle_wp, debug=debug)
+                    if blocking_control is not None:
+                        return blocking_control
                     return self._creep_past_pedestrian(debug=debug)
                 return self.emergency_stop()
             self._update_pedestrian_wait_tracking(None)
@@ -1213,6 +1278,10 @@ class BehaviorAgent(BasicAgent):
 
         # 2.2: Static obstacle bypass behavior (construction/accident/parked vehicle)
         if self.bypass_obstacle_manager(ego_vehicle_wp):
+            blocking_control = self._react_to_moving_obstacle(ego_vehicle_wp, debug=debug)
+            if blocking_control is not None:
+                return blocking_control
+
             target_speed = min([
                 self._behavior.max_speed,
                 self._speed_limit - self._behavior.speed_lim_dist])
