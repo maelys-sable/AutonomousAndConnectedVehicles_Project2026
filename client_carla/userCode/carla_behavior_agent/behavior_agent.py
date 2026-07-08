@@ -107,7 +107,7 @@ class BehaviorAgent(BasicAgent):
         # Cycle : 'idle' -> 'waiting_gap' -> 'overtaking' -> 'returning' -> 'idle'
         self._bypass_state = 'idle'
         self._bypass_origin_waypoint = None
-        self._bypass_tick_counter = 0
+        self._bypass_start_tick = None
 
         self._actors = None
 
@@ -116,7 +116,7 @@ class BehaviorAgent(BasicAgent):
 
         # Cycle : 'idle' -> 'waiting_clear' -> 'crossing' -> 'idle'
         self._junction_state = 'idle'
-        self._junction_tick_counter = 0
+        self._junction_start_tick = None
 
         # Stalled-vehicle tracking (see STALL_TIMEOUT_TICKS)
         self._stalled_vehicle_id = None
@@ -128,7 +128,8 @@ class BehaviorAgent(BasicAgent):
 
         # Cycle : 'idle' -> 'stabilizing' -> 'idle' (Block 5: ControlLoss)
         self._control_loss_state = 'idle'
-        self._control_loss_tick_counter = 0
+        self._control_loss_start_tick = None   # absolute self._tick_count when stabilizing began
+        self._control_loss_pending_ticks = 0   # consecutive detections while still 'idle' (debounce)
 
     def _refresh_actor_snapshot(self):
         """
@@ -181,14 +182,22 @@ class BehaviorAgent(BasicAgent):
 
     def _bypass_timed_out(self):
         """
-        Increments the bypass lock counter and indicates whether the operation
-        has been running for too long (enables detection of a scenario failure
-        without waiting for the route’s global timeout).
+        Indicates whether the bypass manoeuvre has been running for too
+        long (enables detection of a scenario failure without waiting for
+        the route's global timeout).
+
+        Measured against `self._tick_count` (incremented unconditionally at
+        the very start of every `run_step`) rather than a counter
+        incremented only while this method is actually called - see the
+        identical fix and rationale on `_control_loss_timed_out`: a
+        per-call counter can freeze for an arbitrarily long real-world time
+        whenever a higher-priority branch earlier in `run_step` (pedestrian
+        wait, control-loss stabilizing...) keeps returning before ever
+        reaching this check.
 
             :return: True if the operation is considered to be blocked
         """
-        self._bypass_tick_counter += 1
-        return self._bypass_tick_counter > self.BYPASS_TIMEOUT_TICKS
+        return (self._tick_count - self._bypass_start_tick) > self.BYPASS_TIMEOUT_TICKS
 
     def _update_information(self):
         """
@@ -615,7 +624,7 @@ class BehaviorAgent(BasicAgent):
         """Resets the status of the bypass module."""
         self._bypass_state = 'idle'
         self._bypass_origin_waypoint = None
-        self._bypass_tick_counter = 0
+        self._bypass_start_tick = None
         self._stalled_vehicle_id = None
         self._stalled_tick_counter = 0
 
@@ -635,6 +644,7 @@ class BehaviorAgent(BasicAgent):
             if obstacle_state:
                 self._bypass_origin_waypoint = waypoint
                 self._bypass_state = 'waiting_gap'
+                self._bypass_start_tick = self._tick_count
                 self._log_bypass_transition('detected', waypoint)
             return self._bypass_state != 'idle'
 
@@ -713,20 +723,23 @@ class BehaviorAgent(BasicAgent):
 
     def _junction_timed_out(self):
         """
-        Increments the junction-wait counter and indicates whether the agent
-        has been waiting too long to enter/cross (prevents the "stuck
-        forever at an intersection" failure mode and the resulting scenario
-        timeout infraction).
+        Indicates whether the agent has been waiting too long to enter or
+        cross the junction (prevents the "stuck forever at an
+        intersection" failure mode and the resulting scenario timeout
+        infraction).
+
+        Measured against `self._tick_count` rather than a counter
+        incremented only while this method is called - see the identical
+        fix and rationale on `_control_loss_timed_out` / `_bypass_timed_out`.
 
             :return: True if the wait is considered excessive
         """
-        self._junction_tick_counter += 1
-        return self._junction_tick_counter > self.JUNCTION_TIMEOUT_TICKS
+        return (self._tick_count - self._junction_start_tick) > self.JUNCTION_TIMEOUT_TICKS
 
     def _reset_junction_state(self):
         """Resets the status of the junction-crossing module."""
         self._junction_state = 'idle'
-        self._junction_tick_counter = 0
+        self._junction_start_tick = None
 
     def _log_junction_transition(self, event, waypoint=None):
         """
@@ -771,6 +784,7 @@ class BehaviorAgent(BasicAgent):
 
         if self._junction_state == 'idle':
             self._junction_state = 'waiting_clear'
+            self._junction_start_tick = self._tick_count
             self._log_junction_transition('waiting', waypoint)
 
         if self._junction_timed_out():
@@ -811,7 +825,6 @@ class BehaviorAgent(BasicAgent):
             :return vehicle: nearby walker
             :return distance: distance to nearby walker
         """
-
         walker_list = self._actors.filter("*walker.pedestrian*")
         def dist(w): return w.get_location().distance(waypoint.transform.location)
         walker_list = [w for w in walker_list if dist(w) < self._collision_detection_range()]
@@ -970,8 +983,16 @@ class BehaviorAgent(BasicAgent):
         :param waypoint: the agent's current waypoint
         :return: True if the vehicle's heading has drifted away from the
             road by more than the (weather-adjusted) threshold, at a speed
-            high enough for heading to be meaningful.
+            high enough for heading to be meaningful, and while the agent
+            isn't in the middle of a DELIBERATE lane change (bypass
+            overtake/return, tailgating shift...). Those manoeuvres cause a
+            large, intentional heading gap by design - without this guard
+            they were being misread as a skid (observed in simulation: a
+            false "ControlLoss" during ordinary lane-change traffic caused
+            the agent to lose the bypass in progress and drift off-road).
         """
+        if self._direction in (RoadOption.CHANGELANELEFT, RoadOption.CHANGELANERIGHT):
+            return False
         if self._speed < self.CONTROL_LOSS_MIN_SPEED_KMH:
             return False
         return self._heading_deviation(waypoint) > self._control_loss_heading_threshold()
@@ -992,13 +1013,13 @@ class BehaviorAgent(BasicAgent):
             CONTROL_LOSS_TIMEOUT_TICKS, so a stuck reading can't cap the
             vehicle's speed forever.
         """
-        self._control_loss_tick_counter += 1
-        return self._control_loss_tick_counter > self.CONTROL_LOSS_TIMEOUT_TICKS
+        return (self._tick_count - self._control_loss_start_tick) > self.CONTROL_LOSS_TIMEOUT_TICKS
 
     def _reset_control_loss_state(self):
         """Resets the status of the control-loss stabilization module."""
         self._control_loss_state = 'idle'
-        self._control_loss_tick_counter = 0
+        self._control_loss_start_tick = None
+        self._control_loss_pending_ticks = 0
 
     def _log_control_loss_transition(self, event, waypoint=None):
         """
@@ -1040,9 +1061,14 @@ class BehaviorAgent(BasicAgent):
         """
         if self._control_loss_state == 'idle':
             if self._control_loss_detected(waypoint):
-                self._control_loss_state = 'stabilizing'
-                self._control_loss_tick_counter = 0
-                self._log_control_loss_transition('detected', waypoint)
+                self._control_loss_pending_ticks += 1
+                if self._control_loss_pending_ticks >= self.CONTROL_LOSS_DEBOUNCE_TICKS:
+                    self._control_loss_state = 'stabilizing'
+                    self._control_loss_start_tick = self._tick_count
+                    self._control_loss_pending_ticks = 0
+                    self._log_control_loss_transition('detected', waypoint)
+            else:
+                self._control_loss_pending_ticks = 0
             return self._control_loss_state != 'idle'
 
         if self._control_loss_timed_out():
