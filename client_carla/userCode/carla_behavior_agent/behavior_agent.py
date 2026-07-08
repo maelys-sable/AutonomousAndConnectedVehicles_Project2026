@@ -47,6 +47,25 @@ class BehaviorAgent(BasicAgent):
 
     LATERAL_HAZARD_HALF_WIDTH = 3.0   # m either side of the lane centerline still considered a hazard
 
+    # Overtake trigger (user request, cf. Route1_Plan_Strategie_Obstacles.md):
+    # a lane-change bypass must ONLY be attempted for (1) a static obstacle,
+    # (2) a cyclist ahead or beside, or (3) a vehicle confirmed genuinely
+    # stalled (not just paused for a stop sign/red light/pulling away) -
+    # never as a default reaction to "there is something in front of me"
+    # (that default case is car-following, see `car_following_manager`).
+    CYCLIST_TYPE_KEYWORDS = (
+        'vehicle.bh.crossbike',
+        'vehicle.diamondback.century',
+        'vehicle.gazelle.omafiets',
+    )  # the CARLA bike blueprints - a cyclist is a `vehicle`-type actor, not
+       # a `walker.pedestrian` one, see Route1_Plan_Strategie_Obstacles.md §6.2
+
+    JUNCTION_STALL_EXCLUSION_DISTANCE = 25.0   # m - a vehicle stopped at/within this
+                                                 # distance of a junction is never classified
+                                                 # as "stalled", however long it waits: this is
+                                                 # a stop sign, a red light, or the first seconds
+                                                 # of pulling away from either, not a breakdown.
+
     BYPASS_DETECTION_DISTANCE = 80
     BYPASS_MIN_GAP_TIME = 4.0
     BYPASS_LANE_OVERLAP_MARGIN = 0.3   # m of slack added to half the lane width when deciding whether
@@ -266,14 +285,16 @@ class BehaviorAgent(BasicAgent):
             'resumed_normal': f"[BYPASS] Target resumed normal driving{pos}{obstacle_info} "
                                f"-> was never really stalled, aborting manoeuvre and reverting "
                                f"to car-following",
+            'cyclist_gone': f"[BYPASS] Tracked cyclist no longer detected{pos}{obstacle_info} "
+                             f"-> aborting manoeuvre and reverting to normal behaviour",
         }
         print(messages[event])
         if event == 'success':
             self._scenario_result = True
         elif event in ('timeout', 'no_lane'):
             self._scenario_result = False
-        # 'resumed_normal' is a correct self-diagnosis, not a scenario failure - it deliberately
-        # leaves self._scenario_result untouched.
+        # 'resumed_normal' and 'cyclist_gone' are correct self-diagnoses, not scenario
+        # failures - they deliberately leave self._scenario_result untouched.
 
     def _bypass_timed_out(self):
         """
@@ -453,6 +474,30 @@ class BehaviorAgent(BasicAgent):
         lateral = dx * right[0] + dy * right[1]
         return longitudinal, lateral
 
+    def _closest_forward_lateral(self, obstacle_list, waypoint):
+        """
+        Among `obstacle_list`, finds the closest actor that is ahead of the
+        agent (longitudinal > 0) and within `LATERAL_HAZARD_HALF_WIDTH` of
+        the lane centerline - factored out of `_lateral_hazard_ahead` so
+        the same geometric scan can be restricted to a subset of actors
+        (e.g. cyclists only, see `_cyclist_ahead`).
+
+            :param obstacle_list: candidate actors to scan
+            :param waypoint: the agent's current waypoint
+            :return: tuple (actor, longitudinal_distance), (None, None) if none qualify
+        """
+        closest = None
+        closest_distance = None
+        for actor in obstacle_list:
+            longitudinal, lateral = self._road_projection(actor, waypoint)
+            if longitudinal <= 0:
+                continue  # behind the agent
+            if abs(lateral) > self.LATERAL_HAZARD_HALF_WIDTH:
+                continue  # too far to the side to be a real hazard
+            if closest_distance is None or longitudinal < closest_distance:
+                closest, closest_distance = actor, longitudinal
+        return closest, closest_distance
+
     def _lateral_hazard_ahead(self, waypoint):
         """
         Direct geometric scan for something approaching the road from the
@@ -465,16 +510,7 @@ class BehaviorAgent(BasicAgent):
             :return: tuple (hazard_state, actor, longitudinal_distance)
         """
         obstacle_list = self._build_obstacle_list(waypoint, max_distance=self._collision_detection_range())
-        closest = None
-        closest_distance = None
-        for actor in obstacle_list:
-            longitudinal, lateral = self._road_projection(actor, waypoint)
-            if longitudinal <= 0:
-                continue  # behind the agent
-            if abs(lateral) > self.LATERAL_HAZARD_HALF_WIDTH:
-                continue  # too far to the side to be a real hazard
-            if closest_distance is None or longitudinal < closest_distance:
-                closest, closest_distance = actor, longitudinal
+        closest, closest_distance = self._closest_forward_lateral(obstacle_list, waypoint)
         if closest is None:
             return False, None, -1
         return True, closest, closest_distance
@@ -614,6 +650,69 @@ class BehaviorAgent(BasicAgent):
         obstacle_half_width = max(obstacle.bounding_box.extent.x, obstacle.bounding_box.extent.y)
         return (abs(lateral) - obstacle_half_width) < (waypoint.lane_width / 2.0 + self.BYPASS_LANE_OVERLAP_MARGIN)
 
+    def _is_cyclist(self, actor):
+        """
+        A cyclist is a `vehicle`-type actor in CARLA (not a
+        `walker.pedestrian` one), so it has to be told apart from cars by
+        its blueprint id (see `CYCLIST_TYPE_KEYWORDS`).
+
+            :param actor: the candidate actor
+            :return: True if its blueprint is one of the known bike models
+        """
+        return any(keyword in actor.type_id for keyword in self.CYCLIST_TYPE_KEYWORDS)
+
+    def _cyclist_ahead(self, waypoint):
+        """
+        Detects a cyclist directly ahead OR still to the side (shoulder /
+        bike lane) of the agent - a cyclist is the one moving-vehicle case
+        that must trigger an overtake decision on its own rather than plain
+        car-following (user request). Restricted to bike-blueprint actors
+        only, so an ordinary car ahead never takes this path.
+
+            :param waypoint: the agent's current waypoint
+            :return: tuple (cyclist_state, cyclist, distance)
+        """
+        obstacle_list = self._build_obstacle_list(waypoint, max_distance=self.BYPASS_DETECTION_DISTANCE)
+        cyclist_list = [a for a in obstacle_list if self._is_cyclist(a)]
+        if not cyclist_list:
+            return False, None, -1
+
+        forward_state, forward_actor, forward_distance = self._vehicle_obstacle_detected(
+            cyclist_list, self.BYPASS_DETECTION_DISTANCE, up_angle_th=self._forward_detection_angle())
+        lateral_actor, lateral_distance = self._closest_forward_lateral(cyclist_list, waypoint)
+
+        if forward_state and lateral_actor is not None:
+            if forward_distance <= lateral_distance:
+                return True, forward_actor, forward_distance
+            return True, lateral_actor, lateral_distance
+        if forward_state:
+            return True, forward_actor, forward_distance
+        if lateral_actor is not None:
+            return True, lateral_actor, lateral_distance
+        return False, None, -1
+
+    def _bypass_target_still_present(self, waypoint):
+        """
+        For a bypass currently targeting a cyclist: True unless that
+        specific cyclist has vanished from the scene entirely (destroyed,
+        or moved out of detection range) - user request: "revenir à l'état
+        normal quand le vélo n'est plus détecté devant ou sur le côté".
+        A no-op (always True) for a static obstacle or a confirmed-stalled
+        vehicle, neither of which is expected to move away on its own
+        (a stalled vehicle driving off is already handled separately, see
+        `_bypass_target_resumed_normal_driving`).
+
+            :param waypoint: the agent's current waypoint
+            :return: False only if a tracked cyclist has disappeared
+        """
+        actor = self._bypass_target_actor
+        if actor is None or not self._is_cyclist(actor):
+            return True
+        if not actor.is_alive:
+            return False
+        obstacle_list = self._build_obstacle_list(waypoint, max_distance=self.BYPASS_DETECTION_DISTANCE)
+        return any(a.id == actor.id for a in obstacle_list)
+
     def _static_obstacle_ahead(self, waypoint):
         """
         Detects a static obstacle (roadworks, accident, parked vehicle)
@@ -694,6 +793,27 @@ class BehaviorAgent(BasicAgent):
         return (self._stalled_tick_counter > self.STALL_TIMEOUT_TICKS
                 and self._ego_blocked_tick_counter > self.EGO_BLOCKED_CONFIRM_TICKS)
 
+    def _near_junction(self, location, distance):
+        """
+        True if a junction starts within `distance` metres ahead of
+        `location` along its current lane, or if `location` already sits
+        inside one. Used to tell a vehicle genuinely stalled in open road
+        (AccidentTwoWays, a broken-down car) apart from one simply obeying
+        a stop sign or a red light, or still in the first seconds of
+        pulling away from either - all of which happen right at a
+        junction and must never be mistaken for a permanent blockage,
+        however long the wait lasts.
+
+            :param location: the point to check
+            :param distance: how far ahead to look, in metres
+            :return: True if a junction is at or within reach of that point
+        """
+        wp = self._map.get_waypoint(location)
+        if wp.is_junction:
+            return True
+        ahead = wp.next(distance)
+        return any(w.is_junction for w in ahead)
+
     def _stalled_vehicle_ahead(self, waypoint):
         """
         Detects a vehicle ahead that has been confirmed stalled (see
@@ -701,12 +821,27 @@ class BehaviorAgent(BasicAgent):
         the lane (AccidentTwoWays), as opposed to a static prop already
         covered by `_static_obstacle_ahead`.
 
+        Deliberately excludes a cyclist (handled by `_cyclist_ahead`) and
+        any vehicle stopped at or approaching a junction (see
+        `_near_junction`) - a car paused for a stop sign, a red light, or
+        just pulling away from either must never be diagnosed as stalled,
+        no matter how long the wait (user request).
+
             :param waypoint: the agent's current waypoint
             :return: tuple (obstacle_state, obstacle, distance)
         """
         obstacle_list = self._build_obstacle_list(waypoint, max_distance=self.BYPASS_DETECTION_DISTANCE)
         vehicle_state, vehicle, distance = self._vehicle_obstacle_detected(
             obstacle_list, self.BYPASS_DETECTION_DISTANCE, up_angle_th=self.FORWARD_ANGLE_STRAIGHT)
+
+        if vehicle_state and self._is_cyclist(vehicle):
+            vehicle_state = False
+
+        if vehicle_state and (
+                self._near_junction(waypoint.transform.location, self.JUNCTION_STALL_EXCLUSION_DISTANCE)
+                or self._near_junction(vehicle.get_location(), self.JUNCTION_STALL_EXCLUSION_DISTANCE)):
+            self._update_stall_tracking(None)
+            return False, None, -1
 
         self._update_stall_tracking(vehicle if vehicle_state else None)
         if (vehicle_state and self._stalled_vehicle_confirmed()
@@ -716,10 +851,14 @@ class BehaviorAgent(BasicAgent):
 
     def _blocking_obstacle_ahead(self, waypoint):
         """
-        Generic entry point for the bypass module: an obstacle to go around
-        is either a static prop (ConstructionObstacleTwoWays, roadworks...)
-        or a vehicle confirmed stalled long enough to be treated the same
-        way (AccidentTwoWays with a wrecked vehicle, a broken-down car...).
+        Generic entry point for the bypass module. An overtake is only
+        ever justified by one of exactly three situations (user request):
+          1. a static obstacle (ConstructionObstacleTwoWays, roadworks...);
+          2. a cyclist ahead or beside (see `_cyclist_ahead`);
+          3. a vehicle confirmed genuinely stalled - NOT a car paused at a
+             stop sign/red light/pulling away (see `_stalled_vehicle_ahead`).
+        Anything else in front of the agent is plain car-following
+        (`car_following_manager`), never a reason to change lane.
 
             :param waypoint: the agent's current waypoint
             :return: tuple (obstacle_state, obstacle, distance)
@@ -727,6 +866,11 @@ class BehaviorAgent(BasicAgent):
         static_state, static_obstacle, static_distance = self._static_obstacle_ahead(waypoint)
         if static_state:
             return static_state, static_obstacle, static_distance
+
+        cyclist_state, cyclist, cyclist_distance = self._cyclist_ahead(waypoint)
+        if cyclist_state:
+            return cyclist_state, cyclist, cyclist_distance
+
         return self._stalled_vehicle_ahead(waypoint)
 
     def _oncoming_lane_obstacle(self, waypoint):
@@ -979,6 +1123,11 @@ class BehaviorAgent(BasicAgent):
         if self._bypass_timed_out():
             self._log_bypass_transition('timeout', waypoint)
             self._record_bypass_failure(self._bypass_target_actor)
+            self._reset_bypass_state()
+            return False
+
+        if not self._bypass_target_still_present(waypoint):
+            self._log_bypass_transition('cyclist_gone', waypoint, obstacle=self._bypass_target_actor)
             self._reset_bypass_state()
             return False
 
