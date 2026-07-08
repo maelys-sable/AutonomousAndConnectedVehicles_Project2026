@@ -49,6 +49,10 @@ class BehaviorAgent(BasicAgent):
 
     BYPASS_DETECTION_DISTANCE = 80
     BYPASS_MIN_GAP_TIME = 4.0
+    BYPASS_OVERTAKE_MARGIN = 8.0   # extra distance (m) travelled past the obstacle's far edge before
+                                    # merging back onto the original lane - "reprise de la trajectoire
+                                    # normale dès que l'obstacle est dépassé" (§3.1/§3.9) still needs a
+                                    # small safety margin, not an instant cut-back right beside it.
 
     STATE_LOG_INTERVAL = 20
     BYPASS_TIMEOUT_TICKS = 800
@@ -73,8 +77,8 @@ class BehaviorAgent(BasicAgent):
     CONTROL_LOSS_DEBOUNCE_TICKS = 3         # consecutive detections required before entering 'stabilizing'
                                              # (filters out single-tick noise from hard braking / waypoint
                                              # jumps that briefly swing the velocity heading without a real skid)
-    CONTROL_LOSS_BYPASS_GRACE_TICKS = 15    
-
+    CONTROL_LOSS_BYPASS_GRACE_TICKS = 15 
+    
     WET_HEADING_MARGIN = 0.7   # multiplier on the heading threshold at max wetness (lower = triggers earlier)
     WET_SPEED_MARGIN = 0.7     # multiplier on the stabilize speed at max wetness (lower = more cautious)
 
@@ -114,6 +118,7 @@ class BehaviorAgent(BasicAgent):
         self._bypass_origin_waypoint = None
         self._bypass_start_tick = None
         self._last_bypass_transition_tick = None   # see `_in_bypass_maneuver_grace_period`
+        self._bypass_target_actor = None 
 
         self._actors = None
 
@@ -478,25 +483,24 @@ class BehaviorAgent(BasicAgent):
             actor.bounding_box.extent.y, actor.bounding_box.extent.x) - max(
                 self._vehicle.bounding_box.extent.y, self._vehicle.bounding_box.extent.x)
 
-    def _react_to_moving_obstacle(self, waypoint, debug=False):
+    def _react_to_moving_obstacle(self, waypoint, debug=False, ignore_actor_id=None):
         """
         Runs the moving-obstacle check (`collision_and_car_avoid_manager`)
         and, if something is within braking range, returns the control to
         apply (emergency stop or car-following) right away.
 
-        This exists so that manoeuvres which used to short-circuit straight
-        to a cruise-speed control - the static-obstacle bypass and the
-        pedestrian creep-past - stay covered by moving-obstacle detection
-        instead of driving blind.
-
             :param waypoint: the agent's current waypoint
             :param debug: boolean for debugging
+            :param ignore_actor_id: id of an actor to disregard even if
+                detected 
             :return: a carla.VehicleControl if a moving obstacle requires
                      immediate action, otherwise None (caller is free to
                      apply its own speed/route for this tick)
         """
         vehicle_state, vehicle, distance = self.collision_and_car_avoid_manager(waypoint)
         if not vehicle_state:
+            return None
+        if ignore_actor_id is not None and vehicle.id == ignore_actor_id:
             return None
 
         distance = self._bbox_adjusted_distance(vehicle, distance)
@@ -632,34 +636,75 @@ class BehaviorAgent(BasicAgent):
             return True
         return self._gap_is_safe(oncoming_distance, get_speed(oncoming_vehicle))
 
-    def _start_bypass_maneuver(self, waypoint):
+    def _estimate_obstacle_length(self, obstacle):
         """
-        Triggers a lateral shift to the opposite lane to bypass the obstacle
-        (same mechanism as `_tailgating`: redefine the local destination to the adjacent lane).
+        Rough longitudinal footprint of the obstacle to clear, from its
+        bounding box (its largest horizontal extent, doubled).
+
+            :param obstacle: the obstacle actor
+            :return: approximate length (m)
+        """
+        return 2.0 * max(obstacle.bounding_box.extent.x, obstacle.bounding_box.extent.y)
+
+    def _bypass_merge_point(self, waypoint, obstacle, obstacle_distance):
+        """
+        Waypoint, on the ORIGINAL lane, far enough past the obstacle to
+        safely merge back: the obstacle's own distance and length, plus a
+        safety margin.
 
             :param waypoint: the agent's current waypoint
+            :param obstacle: the obstacle actor being bypassed
+            :param obstacle_distance: current distance to the obstacle (m)
+            :return: a waypoint on the original lane past the obstacle, or
+                     None if the road doesn't extend that far (dead end,
+                     map edge...)
+        """
+        overtake_length = obstacle_distance + self._estimate_obstacle_length(obstacle) + self.BYPASS_OVERTAKE_MARGIN
+        ahead = waypoint.next(overtake_length)
+        if not ahead:
+            return None
+        return ahead[0]
+
+    def _start_bypass_maneuver(self, waypoint, obstacle, obstacle_distance):
+        """
+        Triggers a lateral shift to the opposite lane to bypass the
+        obstacle, targeting a merge point genuinely past it rather than
+        the very next waypoint (see `_bypass_merge_point`).
+
+            :param waypoint: the agent's current waypoint
+            :param obstacle: the obstacle actor being bypassed
+            :param obstacle_distance: current distance to the obstacle (m)
             :return: True if the manoeuvre could be started, False if there
-                     is no usable opposite lane at this point (edge of the
-                     road, junction, etc.) - the caller must then abandon
-                     the bypass instead of crashing on a None waypoint.
+                     is no usable opposite lane or merge point at this
+                     point (edge of the road, junction, map end...) - the
+                     caller must then abandon the bypass instead of
+                     crashing on a None waypoint.
         """
         opposite_wpt = waypoint.get_left_lane()
         if opposite_wpt is None or opposite_wpt.lane_type != carla.LaneType.Driving:
             return False
-        end_waypoint = self._local_planner.target_waypoint
-        self.set_destination(end_waypoint.transform.location, opposite_wpt.transform.location)
+        merge_waypoint = self._bypass_merge_point(waypoint, obstacle, obstacle_distance)
+        if merge_waypoint is None:
+            return False
+        self.set_destination(merge_waypoint.transform.location, opposite_wpt.transform.location)
+        self._bypass_target_actor = obstacle
         return True
 
     def _obstacle_cleared(self, waypoint):
         """
-        Indicates whether the obstacle that was bypassed has now been passed 
-        (no longer detected in front of the agent).
+        Indicates whether the SPECIFIC obstacle being bypassed has now
+        been passed, using its geometric position relative to the agent
+        (`_road_projection`) rather than re-running the same forward
+        scanner used to detect it in the first place.
 
-            :param waypoint: the agent’s current waypoint
-            :return: True if the obstacle is no longer a frontal obstacle
+            :param waypoint: the agent's current waypoint
+            :return: True if the tracked obstacle is now behind the agent
         """
-        obstacle_state, _, _ = self._blocking_obstacle_ahead(waypoint)
-        return not obstacle_state
+        if self._bypass_target_actor is None:
+            obstacle_state, _, _ = self._blocking_obstacle_ahead(waypoint)
+            return not obstacle_state
+        longitudinal, _ = self._road_projection(self._bypass_target_actor, waypoint)
+        return longitudinal < 0
 
     def _back_on_original_lane(self, waypoint):
         """
@@ -677,6 +722,7 @@ class BehaviorAgent(BasicAgent):
         self._bypass_origin_waypoint = None
         self._bypass_start_tick = None
         self._last_bypass_transition_tick = None
+        self._bypass_target_actor = None
         self._stalled_vehicle_id = None
         self._stalled_tick_counter = 0
 
@@ -708,7 +754,11 @@ class BehaviorAgent(BasicAgent):
 
         if self._bypass_state == 'waiting_gap':
             if self._can_start_bypass(waypoint):
-                if self._start_bypass_maneuver(waypoint):
+                obstacle_state, obstacle, obstacle_distance = self._blocking_obstacle_ahead(waypoint)
+                if not obstacle_state:
+                    self._reset_bypass_state()
+                    return False
+                if self._start_bypass_maneuver(waypoint, obstacle, obstacle_distance):
                     self._bypass_state = 'overtaking'
                     self._last_bypass_transition_tick = self._tick_count
                     self._log_bypass_transition('gap_found', waypoint)
@@ -1278,7 +1328,9 @@ class BehaviorAgent(BasicAgent):
 
         # 2.2: Static obstacle bypass behavior (construction/accident/parked vehicle)
         if self.bypass_obstacle_manager(ego_vehicle_wp):
-            blocking_control = self._react_to_moving_obstacle(ego_vehicle_wp, debug=debug)
+            blocking_control = self._react_to_moving_obstacle(
+                ego_vehicle_wp, debug=debug,
+                ignore_actor_id=self._bypass_target_actor.id if self._bypass_target_actor is not None else None)
             if blocking_control is not None:
                 return blocking_control
 
