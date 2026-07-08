@@ -57,21 +57,25 @@ class BehaviorAgent(BasicAgent):
     JUNCTION_MIN_GAP_TIME = 3.0
     JUNCTION_TIMEOUT_TICKS = 300
 
-    STALL_SPEED_THRESHOLD = 1.0
-    STALL_TIMEOUT_TICKS = 150
+    STALL_SPEED_THRESHOLD = 1.0    # km/h, considered "not moving"
+    STALL_TIMEOUT_TICKS = 150      # ~7.5s at 20 FPS before it's confirmed stalled
+                                    # (long enough not to mistake a stop-sign/queue pause for a wreck)
 
-    PEDESTRIAN_WAIT_TIMEOUT_TICKS = 200
-    PEDESTRIAN_STATIONARY_SPEED = 0.5
-    PEDESTRIAN_CREEP_SPEED = 5            
+    PEDESTRIAN_WAIT_TIMEOUT_TICKS = 200   # ~10s at 20 FPS before creeping past
+    PEDESTRIAN_STATIONARY_SPEED = 0.5     # km/h, considered "not walking"
+    PEDESTRIAN_CREEP_SPEED = 5            # km/h, cautious speed once timed out
 
-    CONTROL_LOSS_HEADING_THRESHOLD = 25.0
-    CONTROL_LOSS_RECOVERY_THRESHOLD = 8.0   
-    CONTROL_LOSS_MIN_SPEED_KMH = 5.0        
-    CONTROL_LOSS_STABILIZE_SPEED = 20.0     
-    CONTROL_LOSS_TIMEOUT_TICKS = 400        
+    CONTROL_LOSS_HEADING_THRESHOLD = 25.0   # deg, uncommanded deviation that triggers stabilization
+    CONTROL_LOSS_RECOVERY_THRESHOLD = 8.0   # deg, hysteresis: must fall back below this to be "recovered"
+    CONTROL_LOSS_MIN_SPEED_KMH = 5.0        # below this, heading is too noisy to mean anything
+    CONTROL_LOSS_STABILIZE_SPEED = 20.0     # km/h, cautious creep while correcting (throttle only, no hard brake)
+    CONTROL_LOSS_TIMEOUT_TICKS = 400        # safety net: a stuck sensor reading can't cap speed forever
+    CONTROL_LOSS_DEBOUNCE_TICKS = 3         # consecutive detections required before entering 'stabilizing'
+                                             # (filters out single-tick noise from hard braking / waypoint
+                                             # jumps that briefly swing the velocity heading without a real skid)
 
-    WET_HEADING_MARGIN = 0.7   
-    WET_SPEED_MARGIN = 0.7     
+    WET_HEADING_MARGIN = 0.7   # multiplier on the heading threshold at max wetness (lower = triggers earlier)
+    WET_SPEED_MARGIN = 0.7     # multiplier on the stabilize speed at max wetness (lower = more cautious)
 
     def __init__(self, vehicle, behavior='normal', opt_dict={}, map_inst=None, grp_inst=None):
         """
@@ -432,6 +436,9 @@ class BehaviorAgent(BasicAgent):
             :return distance: distance to nearby vehicle
         """
 
+        # Candidate list gathered over the SAME range used to test them
+        # (see `_collision_detection_range`), so a static 45 m radius never
+        # silently caps the speed-widened forward detection distance below.
         vehicle_list = self._build_obstacle_list(waypoint, max_distance=self._collision_detection_range())
 
         if self._direction == RoadOption.CHANGELANELEFT:
@@ -825,6 +832,12 @@ class BehaviorAgent(BasicAgent):
             :return vehicle: nearby walker
             :return distance: distance to nearby walker
         """
+
+        # NOTE: this pre-filter used to be a fixed 10 m radius regardless of
+        # speed - the same "hidden bottleneck" bug already fixed for vehicles
+        # in _collision_detection_range(). At cruising speed (~46-49 km/h,
+        # ~13 m/s) 10 m gives under a second of reaction time, which is
+        # consistent with the pedestrian collision seen in simulation logs.
         walker_list = self._actors.filter("*walker.pedestrian*")
         def dist(w): return w.get_location().distance(waypoint.transform.location)
         walker_list = [w for w in walker_list if dist(w) < self._collision_detection_range()]
@@ -1191,7 +1204,6 @@ class BehaviorAgent(BasicAgent):
         else:
             self._update_pedestrian_wait_tracking(None)
 
-        # 2.15: Control-loss stabilization
         if self.control_loss_manager(ego_vehicle_wp):
             target_speed = min([
                 self._control_loss_stabilize_speed(),
