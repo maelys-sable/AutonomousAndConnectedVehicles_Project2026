@@ -62,6 +62,19 @@ class BehaviorAgent(BasicAgent):
                                     # normale dès que l'obstacle est dépassé" (§3.1/§3.9) still needs a
                                     # small safety margin, not an instant cut-back right beside it.
 
+    BYPASS_ABORT_RESUME_SPEED_THRESHOLD = 8.0   # km/h - well above STALL_SPEED_THRESHOLD (1.0): if the
+                                                  # vehicle being bypassed sustains a real driving speed
+                                                  # DURING the 'overtaking' phase, it was never genuinely
+                                                  # stalled - just an ordinary lead vehicle that paused
+                                                  # briefly (queue, TM not having released it yet...) and
+                                                  # got misclassified as a permanent obstacle (AccidentTwoWays).
+                                                  # Chasing a vehicle that is simply driving normally is
+                                                  # exactly "suivre un véhicule", not overtaking a blockage.
+    BYPASS_ABORT_RESUME_TICKS = 40   # ~2s at 20 FPS of sustained normal speed before aborting the
+                                       # manoeuvre - long enough to ignore a single-tick noise blip,
+                                       # short enough to bail out well before BYPASS_TIMEOUT_TICKS (800)
+                                       # instead of dragging the failure out to a full scenario timeout.
+
     STATE_LOG_INTERVAL = 20
     BYPASS_TIMEOUT_TICKS = 800
 
@@ -75,6 +88,17 @@ class BehaviorAgent(BasicAgent):
     EGO_BLOCKED_SPEED_THRESHOLD = 2.0    # km/h, ego itself considered "not moving"
     EGO_BLOCKED_CONFIRM_TICKS = 100 
     BYPASS_MAX_CONSECUTIVE_RETRIES = 2
+
+    STALL_STARTUP_GRACE_TICKS = 200   # ~10s at 20 FPS since episode/agent start (self._tick_count,
+                                        # not per-vehicle) during which a stalled-vehicle confirmation
+                                        # is suppressed entirely. At the very start of a route every
+                                        # actor - ego included - spawns at rest and takes a few seconds
+                                        # to accelerate; without this grace period, a lead vehicle
+                                        # doing that exact same normal spawn-in ramp-up (not a wreck)
+                                        # satisfies both STALL_TIMEOUT_TICKS and EGO_BLOCKED_CONFIRM_TICKS
+                                        # purely because ego is *also* still stationary right behind it
+                                        # for the same reason, triggering an unwarranted overtake of a
+                                        # vehicle that is simply starting to drive, like the ego itself.
 
     PEDESTRIAN_WAIT_TIMEOUT_TICKS = 200   # ~10s at 20 FPS before creeping past
     PEDESTRIAN_STATIONARY_SPEED = 0.5     # km/h, considered "not walking"
@@ -136,6 +160,7 @@ class BehaviorAgent(BasicAgent):
         self._bypass_start_tick = None
         self._last_bypass_transition_tick = None   # see `_in_bypass_maneuver_grace_period`
         self._bypass_target_actor = None       
+        self._bypass_target_resumed_tick_counter = 0   # see `_update_bypass_target_resumed_tracking`
 
         self._actors = None
 
@@ -210,6 +235,9 @@ class BehaviorAgent(BasicAgent):
             'timeout': f"[BYPASS] TEST FAILED: manoeuvre timed out{pos}"
                        f"(stuck in '{self._bypass_state}')",
             'no_lane': f"[BYPASS] TEST FAILED: no usable opposite lane{pos} -> abandoning bypass",
+            'resumed_normal': f"[BYPASS] Target resumed normal driving{pos}{obstacle_info} "
+                               f"-> was never really stalled, aborting manoeuvre and reverting "
+                               f"to car-following",
         }
         print(messages[event])
         if event == 'success':
@@ -607,8 +635,16 @@ class BehaviorAgent(BasicAgent):
         :return: True once the currently tracked vehicle has been
             stationary long enough, AND ego has itself been essentially
             stopped directly behind it for long enough, to be treated as
-            a permanent obstacle worth a lane departure.
+            a permanent obstacle worth a lane departure. Always False
+            during the episode's startup grace window (see
+            `STALL_STARTUP_GRACE_TICKS`): at the very start every actor,
+            ego included, is still at rest and about to accelerate for the
+            first time - that is normal spawn-in inertia, not a genuine
+            stall/wreck, even though it can otherwise satisfy both timers
+            below purely by coincidence of timing.
         """
+        if self._tick_count <= self.STALL_STARTUP_GRACE_TICKS:
+            return False
         return (self._stalled_tick_counter > self.STALL_TIMEOUT_TICKS
                 and self._ego_blocked_tick_counter > self.EGO_BLOCKED_CONFIRM_TICKS)
 
@@ -769,6 +805,35 @@ class BehaviorAgent(BasicAgent):
         longitudinal, _ = self._road_projection(self._bypass_target_actor, waypoint)
         return longitudinal < 0
 
+    def _update_bypass_target_resumed_tracking(self):
+        """
+        Tracks whether the vehicle currently being bypassed has sustained a
+        normal driving speed during the 'overtaking' phase. A genuinely
+        stalled/wrecked vehicle (AccidentTwoWays) stays essentially
+        motionless throughout the manoeuvre; if it instead sustains a real
+        speed, it was never actually stalled - just an ordinary lead
+        vehicle that paused briefly in traffic (queue, TM not having
+        released it yet...) and got misclassified as a permanent obstacle.
+        Continuing to chase it would just be ordinary car-following
+        disguised as an overtake (see `BYPASS_ABORT_RESUME_TICKS`).
+        """
+        if self._bypass_target_actor is None:
+            self._bypass_target_resumed_tick_counter = 0
+            return
+        if get_speed(self._bypass_target_actor) > self.BYPASS_ABORT_RESUME_SPEED_THRESHOLD:
+            self._bypass_target_resumed_tick_counter += 1
+        else:
+            self._bypass_target_resumed_tick_counter = 0
+
+    def _bypass_target_resumed_normal_driving(self):
+        """
+        :return: True once the tracked obstacle has sustained a normal
+            driving speed long enough during the manoeuvre to conclude it
+            was never a genuine permanent blockage, and the bypass should
+            be aborted rather than pursued until `BYPASS_TIMEOUT_TICKS`.
+        """
+        return self._bypass_target_resumed_tick_counter > self.BYPASS_ABORT_RESUME_TICKS
+
     def _back_on_original_lane(self, waypoint):
         """
         Indicates whether the agent has returned to its original path after taking a detour.
@@ -819,6 +884,7 @@ class BehaviorAgent(BasicAgent):
         self._bypass_start_tick = None
         self._last_bypass_transition_tick = None
         self._bypass_target_actor = None
+        self._bypass_target_resumed_tick_counter = 0
         self._stalled_vehicle_id = None
         self._stalled_tick_counter = 0
         self._ego_blocked_tick_counter = 0
@@ -871,6 +937,12 @@ class BehaviorAgent(BasicAgent):
             return True
 
         if self._bypass_state == 'overtaking':
+            self._update_bypass_target_resumed_tracking()
+            if self._bypass_target_resumed_normal_driving():
+                self._log_bypass_transition('resumed_normal', waypoint, obstacle=self._bypass_target_actor)
+                self._record_bypass_failure(self._bypass_target_actor)
+                self._reset_bypass_state()
+                return False
             if self._obstacle_cleared(waypoint):
                 self._bypass_state = 'returning'
                 self._last_bypass_transition_tick = self._tick_count
