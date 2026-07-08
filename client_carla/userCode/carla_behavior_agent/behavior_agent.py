@@ -88,17 +88,43 @@ class BehaviorAgent(BasicAgent):
     EGO_BLOCKED_SPEED_THRESHOLD = 2.0    # km/h, ego itself considered "not moving"
     EGO_BLOCKED_CONFIRM_TICKS = 100 
     BYPASS_MAX_CONSECUTIVE_RETRIES = 2
+    BYPASS_GIVEUP_COOLDOWN_TICKS = 300   # ~15s at 20 FPS - after giving up on an actor (see
+                                           # `_record_bypass_failure`), the agent stops trying to
+                                           # bypass it for this long, then reconsiders. A PERMANENT
+                                           # blacklist (the previous behaviour) is only safe for the
+                                           # exact failure mode it targets - endlessly re-chasing an
+                                           # ordinary moving vehicle - but the same actor can later
+                                           # become a genuine, permanent blockage (e.g. a cyclist that
+                                           # finishes its scripted path and stops for good in the
+                                           # lane): with no cooldown, the agent would then fall back
+                                           # to plain car-following/emergency-stop against it forever,
+                                           # since it would never be allowed to attempt a bypass again
+                                           # (observed: RouteCompletionTest stuck at ~12% after a
+                                           # legitimate HazardAtSideLaneTwoWays bypass timed out).
 
-    STALL_STARTUP_GRACE_TICKS = 200   # ~10s at 20 FPS since episode/agent start (self._tick_count,
-                                        # not per-vehicle) during which a stalled-vehicle confirmation
-                                        # is suppressed entirely. At the very start of a route every
-                                        # actor - ego included - spawns at rest and takes a few seconds
-                                        # to accelerate; without this grace period, a lead vehicle
-                                        # doing that exact same normal spawn-in ramp-up (not a wreck)
-                                        # satisfies both STALL_TIMEOUT_TICKS and EGO_BLOCKED_CONFIRM_TICKS
-                                        # purely because ego is *also* still stationary right behind it
-                                        # for the same reason, triggering an unwarranted overtake of a
-                                        # vehicle that is simply starting to drive, like the ego itself.
+    STALL_MIN_EGO_MOVED_SPEED_KMH = 10.0   # km/h - clearly above EGO_BLOCKED_SPEED_THRESHOLD (2.0):
+                                             # once ego has been observed going at least this fast
+                                             # ONCE since the start of the episode, it has proven it
+                                             # is capable of normal driving - any later stand-still
+                                             # behind a vehicle is then a genuine blockage, not launch
+                                             # inertia. Kept as a one-way latch (see
+                                             # `_ego_has_moved_normally`) rather than a fixed tick
+                                             # count: a fixed duration guesses how long spawn-in
+                                             # acceleration takes, which varies with CARLA/traffic
+                                             # conditions, whereas "has it ever actually driven yet"
+                                             # adapts automatically to however long that really takes.
+    STALL_STARTUP_HARD_BLOCK_TICKS = 400   # ~20s - safety net for the (unlikely on this route, but
+                                             # possible in general) case where a real obstacle sits
+                                             # right at the route's very first waypoint: if ego has
+                                             # been blocked this long WITHOUT ever having proven it can
+                                             # move, treat it as a genuine blockage anyway rather than
+                                             # waiting on `_ego_has_moved_normally` forever.
+    STALL_STARTUP_GRACE_TICKS = 200   # ~10s at 20 FPS - secondary, purely time-based gate on top of
+                                        # `_ego_has_moved_normally`: even once ego has proven it can
+                                        # drive normally, still ignore stall confirmations for this
+                                        # long since episode start, in case that first burst of normal
+                                        # speed was itself a fluke (e.g. a brief gap before merging
+                                        # back behind the very vehicle now being tracked).
 
     PEDESTRIAN_WAIT_TIMEOUT_TICKS = 200   # ~10s at 20 FPS before creeping past
     PEDESTRIAN_STATIONARY_SPEED = 0.5     # km/h, considered "not walking"
@@ -174,9 +200,11 @@ class BehaviorAgent(BasicAgent):
         # Stalled-vehicle tracking (see STALL_TIMEOUT_TICKS)
         self._stalled_vehicle_id = None
         self._stalled_tick_counter = 0
-        self._ego_blocked_tick_counter = 0  
+        self._ego_blocked_tick_counter = 0
+        self._ego_has_moved_normally = False   # see STALL_MIN_EGO_MOVED_SPEED_KMH  
 
         self._bypass_giveup_id = None
+        self._bypass_giveup_tick = None
         self._last_bypass_failed_id = None
         self._bypass_retry_count = 0
 
@@ -244,6 +272,8 @@ class BehaviorAgent(BasicAgent):
             self._scenario_result = True
         elif event in ('timeout', 'no_lane'):
             self._scenario_result = False
+        # 'resumed_normal' is a correct self-diagnosis, not a scenario failure - it deliberately
+        # leaves self._scenario_result untouched.
 
     def _bypass_timed_out(self):
         """
@@ -613,6 +643,9 @@ class BehaviorAgent(BasicAgent):
 
             :param vehicle: the vehicle currently detected ahead, or None
         """
+        if self._speed > self.STALL_MIN_EGO_MOVED_SPEED_KMH:
+            self._ego_has_moved_normally = True
+
         if vehicle is None or get_speed(vehicle) > self.STALL_SPEED_THRESHOLD:
             self._stalled_vehicle_id = None
             self._stalled_tick_counter = 0
@@ -635,14 +668,27 @@ class BehaviorAgent(BasicAgent):
         :return: True once the currently tracked vehicle has been
             stationary long enough, AND ego has itself been essentially
             stopped directly behind it for long enough, to be treated as
-            a permanent obstacle worth a lane departure. Always False
-            during the episode's startup grace window (see
-            `STALL_STARTUP_GRACE_TICKS`): at the very start every actor,
-            ego included, is still at rest and about to accelerate for the
-            first time - that is normal spawn-in inertia, not a genuine
-            stall/wreck, even though it can otherwise satisfy both timers
-            below purely by coincidence of timing.
+            a permanent obstacle worth a lane departure.
+
+            Suppressed while ego has never yet driven at a normal pace
+            since the episode began (`_ego_has_moved_normally`) AND the
+            block hasn't lasted excessively long either
+            (`STALL_STARTUP_HARD_BLOCK_TICKS`): at the very start of a
+            route every actor, ego included, spawns at rest and takes a
+            moment to accelerate for the first time - that is normal
+            launch inertia, not a genuine stall/wreck, even though it can
+            otherwise satisfy both timers below purely by the coincidence
+            of ego being stuck behind a vehicle going through the exact
+            same startup ramp-up. Using "has ego ever actually moved" (a
+            one-way latch) rather than a fixed tick count means this
+            adapts to however long that ramp-up genuinely takes, instead
+            of guessing a fixed duration. `STALL_STARTUP_HARD_BLOCK_TICKS`
+            is only a safety net for the rarer case of a real obstacle
+            sitting at the route's very first waypoint.
         """
+        if (not self._ego_has_moved_normally
+                and self._ego_blocked_tick_counter <= self.STALL_STARTUP_HARD_BLOCK_TICKS):
+            return False
         if self._tick_count <= self.STALL_STARTUP_GRACE_TICKS:
             return False
         return (self._stalled_tick_counter > self.STALL_TIMEOUT_TICKS
@@ -847,17 +893,20 @@ class BehaviorAgent(BasicAgent):
     def _record_bypass_failure(self, obstacle):
         """
         Tracks consecutive bypass failures (timeout / no usable opposite
-        lane) against the SAME obstacle actor. A genuinely bypassable
-        obstacle (a real ConstructionObstacleTwoWays/AccidentTwoWays/
-        ParkedObstacleTwoWays) normally succeeds within one or two
-        attempts; looping forever against the very same actor is a sign
-        this was never a real, passable blockage - most likely an
-        ordinary vehicle we are simply following (`_stalled_vehicle_confirmed`
-        should now catch most of those, but this is a defensive backstop),
-        or a face-off deadlock our own manoeuvre created with it. Once the
+        lane / target resumed normal driving) against the SAME obstacle
+        actor. A genuinely bypassable obstacle (a real
+        ConstructionObstacleTwoWays/AccidentTwoWays/ParkedObstacleTwoWays)
+        normally succeeds within one or two attempts; looping forever
+        against the very same actor is a sign this attempt wasn't a real,
+        passable blockage right now - most likely an ordinary vehicle we
+        are simply following (`_stalled_vehicle_confirmed` and the
+        resumed-driving abort should now catch most of those), or a
+        face-off deadlock our own manoeuvre created with it. Once the
         retry budget is exhausted we give up on that specific actor for
-        the rest of the episode (see `bypass_obstacle_manager`) and fall
-        back to plain car-following instead of retrying indefinitely.
+        `BYPASS_GIVEUP_COOLDOWN_TICKS` (see `bypass_obstacle_manager`) and
+        fall back to plain car-following instead of retrying immediately -
+        NOT for the rest of the episode, since the same actor can later
+        become a genuine permanent blockage worth a fresh attempt.
 
             :param obstacle: the obstacle actor the failed attempt was
                 against, or None
@@ -869,8 +918,22 @@ class BehaviorAgent(BasicAgent):
         self._bypass_retry_count += 1
         if obstacle_id is not None and self._bypass_retry_count > self.BYPASS_MAX_CONSECUTIVE_RETRIES:
             self._bypass_giveup_id = obstacle_id
+            self._bypass_giveup_tick = self._tick_count
             print(f"[BYPASS] Giving up on obstacle id={obstacle_id} after "
-                  f"{self._bypass_retry_count} failed attempts -> reverting to car-following")
+                  f"{self._bypass_retry_count} failed attempts -> reverting to car-following "
+                  f"for {self.BYPASS_GIVEUP_COOLDOWN_TICKS} ticks")
+
+    def _bypass_giveup_active(self, obstacle_id):
+        """
+        :param obstacle_id: id of the obstacle currently detected as
+            blocking (or None)
+        :return: True if this specific actor is still within its
+            give-up cooldown window and should be ignored by the bypass
+            module for now (see `BYPASS_GIVEUP_COOLDOWN_TICKS`).
+        """
+        if obstacle_id is None or obstacle_id != self._bypass_giveup_id:
+            return False
+        return (self._tick_count - self._bypass_giveup_tick) <= self.BYPASS_GIVEUP_COOLDOWN_TICKS
 
     def _reset_bypass_state(self):
         """
@@ -902,7 +965,7 @@ class BehaviorAgent(BasicAgent):
         """
         if self._bypass_state == 'idle':
             obstacle_state, obstacle, _ = self._blocking_obstacle_ahead(waypoint)
-            if obstacle_state and obstacle.id == self._bypass_giveup_id:
+            if obstacle_state and self._bypass_giveup_active(obstacle.id):
                 obstacle_state = False
             if obstacle_state:
                 self._bypass_origin_waypoint = waypoint
