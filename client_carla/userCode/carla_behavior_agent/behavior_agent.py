@@ -56,6 +56,9 @@ class BehaviorAgent(BasicAgent):
     BYPASS_ABORT_RESUME_SPEED_THRESHOLD = 8.0   
     BYPASS_ABORT_RESUME_TICKS = 40   
 
+    BYPASS_NO_PROGRESS_TICKS = 100      # ~5s at 20 FPS with no gain on passing the target
+    BYPASS_PROGRESS_EPSILON = 0.5       # m, minimum longitudinal gain that counts as progress
+
     STATE_LOG_INTERVAL = 20
     BYPASS_TIMEOUT_TICKS = 800
 
@@ -73,6 +76,15 @@ class BehaviorAgent(BasicAgent):
     STALL_MIN_EGO_MOVED_SPEED_KMH = 10.0   
     STALL_STARTUP_HARD_BLOCK_TICKS = 400   
     STALL_STARTUP_GRACE_TICKS = 200   
+
+    # Wreck-only veto (see `_track_moving_vehicles` / `_stalled_vehicle_ahead`):
+    # any vehicle ever observed driving above this speed is permanently
+    # excluded from the stalled-vehicle bypass. A genuine AccidentTwoWays
+    # wreck is stationary from spawn and never crosses it; an ordinary lead
+    # car - the one we are simply following, or one queued behind the cyclist
+    # / at a blocked intersection - has driven at some point, so it is vetoed
+    # and handled by plain car-following instead of ever being overtaken.
+    STALL_VEHICLE_MOVED_SPEED_KMH = 5.0
 
     PEDESTRIAN_WAIT_TIMEOUT_TICKS = 200   
     PEDESTRIAN_STATIONARY_SPEED = 0.5     
@@ -127,6 +139,8 @@ class BehaviorAgent(BasicAgent):
         self._last_bypass_transition_tick = None   # see `_in_bypass_maneuver_grace_period`
         self._bypass_target_actor = None       
         self._bypass_target_resumed_tick_counter = 0   # see `_update_bypass_target_resumed_tracking`
+        self._bypass_best_offset = None            # see `_update_bypass_progress_tracking`
+        self._bypass_best_offset_tick = None
 
         self._actors = None
 
@@ -142,6 +156,7 @@ class BehaviorAgent(BasicAgent):
         self._stalled_tick_counter = 0
         self._ego_blocked_tick_counter = 0
         self._ego_has_moved_normally = False   # see STALL_MIN_EGO_MOVED_SPEED_KMH  
+        self._vehicles_seen_moving = set()     # ids of vehicles ever seen driving (wreck-only veto)
 
         self._bypass_giveup_id = None
         self._bypass_giveup_tick = None
@@ -167,6 +182,33 @@ class BehaviorAgent(BasicAgent):
         traffic, this may be enough to trigger the simulator’s watchdog.
         """
         self._actors = self._world.get_actors()
+
+    def _track_moving_vehicles(self):
+        """
+        Latches the id of every nearby vehicle ever seen driving at a real
+        speed (above `STALL_VEHICLE_MOVED_SPEED_KMH`). This is the wreck-only
+        discriminator behind `_stalled_vehicle_ahead`: a genuine
+        AccidentTwoWays wreck is stationary from spawn and never enters this
+        set, whereas an ordinary vehicle - the car the ego is simply
+        following, one queued behind the cyclist, one paused at a blocked
+        intersection - has driven at some point and is therefore permanently
+        vetoed as a "stalled obstacle". That is what guarantees the agent
+        only ever overtakes a vehicle that has genuinely never moved, and
+        never the (moving or merely paused) car in front of it (user request).
+
+        Runs once per tick from `_update_information`, over the already
+        refreshed actor snapshot, restricted to the bypass detection range.
+        """
+        if self._actors is None:
+            return
+        ego_location = self._vehicle.get_location()
+        for vehicle in self._actors.filter("*vehicle*"):
+            if vehicle.id == self._vehicle.id:
+                continue
+            if vehicle.get_location().distance(ego_location) > self.BYPASS_DETECTION_DISTANCE:
+                continue
+            if get_speed(vehicle) > self.STALL_VEHICLE_MOVED_SPEED_KMH:
+                self._vehicles_seen_moving.add(vehicle.id)
 
     def _log_vehicle_state(self, waypoint):
         """
@@ -208,11 +250,14 @@ class BehaviorAgent(BasicAgent):
                                f"to car-following",
             'cyclist_gone': f"[BYPASS] Tracked cyclist no longer detected{pos}{obstacle_info} "
                              f"-> aborting manoeuvre and reverting to normal behaviour",
+            'no_progress': f"[BYPASS] TEST FAILED: overtaking made no progress{pos}{obstacle_info} "
+                            f"-> obstacle never passed (deadlock/too slow), giving up and "
+                            f"reverting to car-following",
         }
         print(messages[event])
         if event == 'success':
             self._scenario_result = True
-        elif event in ('timeout', 'no_lane'):
+        elif event in ('timeout', 'no_lane', 'no_progress'):
             self._scenario_result = False
         # 'resumed_normal' and 'cyclist_gone' are correct self-diagnoses, not scenario
         # failures - they deliberately leave self._scenario_result untouched.
@@ -242,6 +287,7 @@ class BehaviorAgent(BasicAgent):
         vehicle based on the surrounding world.
         """
         self._refresh_actor_snapshot()
+        self._track_moving_vehicles()
         self._speed = get_speed(self._vehicle)
         self._speed_limit = self._vehicle.get_speed_limit()
         self._local_planner.set_speed(self._speed_limit)
@@ -637,14 +683,12 @@ class BehaviorAgent(BasicAgent):
     def _bypass_target_is_stalled_vehicle(self):
         """
         True only if the memorized bypass target is a genuine stalled
-        *vehicle* (AccidentTwoWays / broken-down car), as opposed to a
-        static prop (ConstructionObstacleTwoWays / ParkedObstacleTwoWays
-        blocker) or a cyclist (HazardAtSideLaneTwoWays). This distinction
-        matters because only this category is expected to stay motionless:
-        a static prop can never drive off, and a cyclist is deliberately
-        overtaken *while* it moves slowly - so any speed-based "it started
-        driving again" abort must apply to this category ONLY, never to the
-        other two.
+        *vehicle* (AccidentTwoWays / broken-down car), as opposed to a static
+        prop (ConstructionObstacleTwoWays / ParkedObstacleTwoWays blocker) or
+        a cyclist (HazardAtSideLaneTwoWays). Only this category is expected to
+        stay motionless: a static prop can never drive off, and a cyclist is
+        deliberately overtaken *while* it moves slowly - so any speed-based
+        "it started driving again" abort must apply to this category ONLY.
 
             :return: True if the current target is a stalled-type vehicle
         """
@@ -660,21 +704,19 @@ class BehaviorAgent(BasicAgent):
     def _bypass_target_resumed_before_start(self):
         """
         Instantaneous re-validation used in the 'waiting_gap' phase, right
-        before committing to the lane change: True if the tracked target is
-        a stalled-type vehicle (see `_bypass_target_is_stalled_vehicle`)
-        that is now rolling again above `STALL_SPEED_THRESHOLD`.
+        before committing to the lane change: True if the tracked target is a
+        stalled-type vehicle (see `_bypass_target_is_stalled_vehicle`) that is
+        now rolling again above `STALL_SPEED_THRESHOLD`.
 
-        The bypass was justified by that vehicle being *confirmed stalled*;
-        if it has since started moving, that premise is gone and the agent
-        must NOT pull out into the opposite lane. Otherwise an ordinary lead
-        car that merely paused for a few seconds (a queue, dense traffic, a
+        The bypass was justified by that vehicle being *confirmed stalled*; if
+        it has since started moving, that premise is gone and the agent must
+        NOT pull out into the opposite lane. Otherwise an ordinary lead car
+        that merely paused for a few seconds (a queue, dense traffic, a
         scenario-induced hard brake...) gets overtaken the very instant it
-        pulls away - exactly the "incoherent overtake" symptom. This is the
-        cheapest possible abort: it happens before any lateral move, so
-        reverting to plain car-following costs nothing.
+        pulls away - exactly the "incoherent overtake" symptom.
 
-        Complements `_bypass_target_resumed_normal_driving`, which only
-        kicks in *after* the lane change has begun (the 'overtaking' phase).
+        Complements `_bypass_target_resumed_normal_driving`, which only kicks
+        in *after* the lane change has begun (the 'overtaking' phase).
 
             :return: True if the manoeuvre should be aborted before it starts
         """
@@ -683,6 +725,28 @@ class BehaviorAgent(BasicAgent):
         if not self._bypass_target_actor.is_alive:
             return False
         return get_speed(self._bypass_target_actor) > self.STALL_SPEED_THRESHOLD
+
+    def _suppress_bypass_target(self, actor):
+        """
+        Put `actor` straight into the bypass give-up cooldown (see
+        `_bypass_giveup_active`) so the 'idle' branch stops re-detecting it as
+        a blocking obstacle every tick. Used when a vehicle that momentarily
+        satisfied the stalled criteria turns out to be driving normally (see
+        `_bypass_target_resumed_before_start`): without it, aborting reverts
+        to 'idle', which re-detects the very same moving car next tick and
+        re-enters 'waiting_gap' - a per-tick detect/abort ping-pong that spams
+        the logs and thrashes the state machine instead of just car-following.
+        A short cooldown hands the car back to `car_following_manager`; if it
+        genuinely stalls later, a fresh attempt still triggers once the window
+        elapses. Unlike `_record_bypass_failure`, this suppresses immediately
+        (no wasted retries) because no real manoeuvre took place.
+
+            :param actor: the actor to ignore for a cooldown window, or None
+        """
+        if actor is None:
+            return
+        self._bypass_giveup_id = actor.id
+        self._bypass_giveup_tick = self._tick_count
 
     def _static_obstacle_ahead(self, waypoint):
         """
@@ -729,10 +793,7 @@ class BehaviorAgent(BasicAgent):
             # A brand-new tracked vehicle starts fresh at 0 ticks: it must be
             # observed stationary for at least one full SUBSEQUENT tick before
             # any counting begins, rather than being credited a stall tick on
-            # the very tick it is first seen. Without this early return, the
-            # first sighting of any near-zero-speed vehicle immediately scored
-            # tick 1 - an off-by-one that muddles "just spotted, not yet
-            # observed over time" with "confirmed stationary long enough".
+            # the very tick it is first seen.
             return
 
         self._stalled_tick_counter += 1
@@ -815,6 +876,10 @@ class BehaviorAgent(BasicAgent):
 
         if vehicle_state and self._is_cyclist(vehicle):
             vehicle_state = False
+
+        if vehicle_state and vehicle.id in self._vehicles_seen_moving:
+            self._update_stall_tracking(None)
+            return False, None, -1
 
         if vehicle_state and (
                 self._near_junction(waypoint.transform.location, self.JUNCTION_STALL_EXCLUSION_DISTANCE)
@@ -962,18 +1027,14 @@ class BehaviorAgent(BasicAgent):
         """
         Signed distance of `actor` ahead of (>0) or behind (<0) the ego,
         measured along the ego's OWN current forward vector rather than the
-        road frame at a waypoint.
-
-        `_road_projection` uses the heading of the ego's current road
-        waypoint as its longitudinal axis. On a sharply curved road (and
-        Town12 is very sinuous) that axis rotates every tick, so an obstacle
-        the ego has physically driven past can still project to a positive
-        "longitudinal" value and never read as "behind" - which is exactly
+        road frame at a waypoint. `_road_projection` uses the heading of the
+        ego's current road waypoint as its longitudinal axis; on a sharply
+        curved road (Town12 is very sinuous) that axis rotates every tick, so
+        an obstacle the ego has physically driven past can still project to a
+        positive "longitudinal" value and never read as "behind" - which is
         why a cyclist overtake could hang until `BYPASS_TIMEOUT_TICKS`.
-        Projecting onto the ego's actual forward vector instead ties the
-        ahead/behind test to where the car is really pointing, independent
-        of how the lane curves, so "I have passed it" is detected reliably
-        even in the middle of a bend.
+        Projecting onto the ego's actual forward vector ties the ahead/behind
+        test to where the car really points, independent of lane curvature.
 
             :param actor: the actor to locate relative to the ego
             :return: longitudinal offset in metres (positive = ahead of ego)
@@ -988,16 +1049,11 @@ class BehaviorAgent(BasicAgent):
     def _obstacle_cleared(self, waypoint):
         """
         Indicates whether the SPECIFIC obstacle being bypassed has now been
-        passed, using its geometric position relative to the agent rather
-        than re-running the same forward scanner used to detect it.
-
-        The ahead/behind test is taken along the ego's actual heading (see
-        `_ego_longitudinal_offset`) rather than the ego's current road
-        waypoint frame: on a curved road the waypoint frame rotates each
-        tick, which could keep a physically-passed obstacle reading as
-        "still ahead" and hang the manoeuvre until it timed out. A
-        `CLEAR_MARGIN` past zero avoids merging back while the obstacle is
-        still level with the ego.
+        passed. The ahead/behind test is taken along the ego's actual heading
+        (see `_ego_longitudinal_offset`) rather than the ego's current road
+        waypoint frame, which rotates on curves and could keep a
+        physically-passed obstacle reading as "still ahead". A `CLEAR_MARGIN`
+        past zero avoids merging back while the obstacle is still level.
 
             :param waypoint: the agent's current waypoint
             :return: True if the tracked obstacle is now behind the agent
@@ -1036,6 +1092,40 @@ class BehaviorAgent(BasicAgent):
             be aborted rather than pursued until `BYPASS_TIMEOUT_TICKS`.
         """
         return self._bypass_target_resumed_tick_counter > self.BYPASS_ABORT_RESUME_TICKS
+
+    def _update_bypass_progress_tracking(self):
+        """
+        Tracks whether the 'overtaking' phase is converging on passing the
+        target, using its longitudinal offset along the ego heading (see
+        `_ego_longitudinal_offset`). During a healthy overtake that offset
+        decreases monotonically; the tick of the last real improvement is
+        remembered so `_bypass_making_no_progress` can tell a stalled
+        manoeuvre from a converging one. No-op (and resets) outside
+        'overtaking', where sitting still is the correct patient behaviour.
+        """
+        if self._bypass_state != 'overtaking' or self._bypass_target_actor is None:
+            self._bypass_best_offset = None
+            self._bypass_best_offset_tick = None
+            return
+        offset = self._ego_longitudinal_offset(self._bypass_target_actor)
+        if (self._bypass_best_offset is None
+                or offset < self._bypass_best_offset - self.BYPASS_PROGRESS_EPSILON):
+            self._bypass_best_offset = offset
+            self._bypass_best_offset_tick = self._tick_count
+
+    def _bypass_making_no_progress(self):
+        """
+        :return: True once the 'overtaking' phase has gone
+            `BYPASS_NO_PROGRESS_TICKS` without the target getting any closer to
+            being passed - turns a permanent "stuck in 'overtaking'" freeze
+            (ego halted behind the obstacle, never passing it so
+            `_obstacle_cleared` never fires) into a quick abort + give-up
+            cooldown + fallback to car-following, instead of burning the full
+            `BYPASS_TIMEOUT_TICKS` at ~0 km/h and re-attempting the deadlock.
+        """
+        if self._bypass_best_offset_tick is None:
+            return False
+        return (self._tick_count - self._bypass_best_offset_tick) > self.BYPASS_NO_PROGRESS_TICKS
 
     def _back_on_original_lane(self, waypoint):
         """
@@ -1105,6 +1195,8 @@ class BehaviorAgent(BasicAgent):
         self._last_bypass_transition_tick = None
         self._bypass_target_actor = None
         self._bypass_target_resumed_tick_counter = 0
+        self._bypass_best_offset = None
+        self._bypass_best_offset_tick = None
         self._stalled_vehicle_id = None
         self._stalled_tick_counter = 0
         self._ego_blocked_tick_counter = 0
@@ -1148,13 +1240,12 @@ class BehaviorAgent(BasicAgent):
             # Re-validate the memorized target BEFORE committing to the lane
             # change: if the vehicle we confirmed stalled has started rolling
             # again while we waited for a gap, the reason for overtaking is
-            # gone. Abort now, before any lateral move, and revert to plain
-            # car-following. Not flagged as a scenario failure (correct
-            # self-diagnosis) and NOT fed to the give-up circuit-breaker: no
-            # manoeuvre was wasted, and a genuine re-stall later still takes
-            # a full STALL_TIMEOUT_TICKS to re-confirm, so this can't loop.
+            # gone. Abort before any lateral move and suppress that actor for
+            # a short cooldown so 'idle' does not immediately re-detect the
+            # same moving car and thrash. Not a scenario failure.
             if self._bypass_target_resumed_before_start():
                 self._log_bypass_transition('resumed_normal', waypoint, obstacle=self._bypass_target_actor)
+                self._suppress_bypass_target(self._bypass_target_actor)
                 self._reset_bypass_state()
                 return False
 
@@ -1195,6 +1286,12 @@ class BehaviorAgent(BasicAgent):
             self._update_bypass_target_resumed_tracking()
             if self._bypass_target_resumed_normal_driving():
                 self._log_bypass_transition('resumed_normal', waypoint, obstacle=self._bypass_target_actor)
+                self._record_bypass_failure(self._bypass_target_actor)
+                self._reset_bypass_state()
+                return False
+            self._update_bypass_progress_tracking()
+            if self._bypass_making_no_progress():
+                self._log_bypass_transition('no_progress', waypoint, obstacle=self._bypass_target_actor)
                 self._record_bypass_failure(self._bypass_target_actor)
                 self._reset_bypass_state()
                 return False
