@@ -5,13 +5,13 @@
             "route_id": -1,
             "status": "Failed",
             "infractions": {
-                "collisions_layout": 5.137,
+                "collisions_layout": 0.0,
                 "collisions_pedestrian": 0.0,
                 "collisions_vehicle": 0.0,
                 "red_light": 0.0,
-                "stop_infraction": 0.0,
-                "outside_route_lanes": 0.01,
-                "min_speed_infractions": 0.0,
+                "stop_infraction": 2.891,
+                "outside_route_lanes": 0.004,
+                "min_speed_infractions": 2.891,
                 "yield_emergency_vehicles_infractions": 0.0,
                 "scenario_timeouts": 0.0,
                 "route_dev": 0.0,
@@ -19,9 +19,9 @@
                 "route_timeout": 0.0
             },
             "scores_mean": {
-                "score_composed": 4.997345,
-                "score_route": 12.14,
-                "score_penalty": 0.411643
+                "score_composed": 54.771049,
+                "score_route": 69.54,
+                "score_penalty": 0.787619
             },
             "scores_std_dev": {
                 "score_composed": "NaN",
@@ -31,7 +31,7 @@
             "meta": {
                 "exceptions": [
                     [
-                        "RouteScenario_1_rep0",
+                        "RouteScenario_0_rep0",
                         0,
                         "Failed"
                     ]
@@ -45,22 +45,23 @@
         "records": [
             {
                 "index": 0,
-                "route_id": "RouteScenario_1_rep0",
+                "route_id": "RouteScenario_0_rep0",
                 "status": "Failed",
                 "num_infractions": 3,
                 "infractions": {
-                    "collisions_layout": [
-                        "Agent collided against object with type=static.prop.constructioncone and id=18846 at (x=-1376.517, y=1608.193, z=327.792)",
-                        "Agent collided against object with type=static.prop.constructioncone and id=18845 at (x=-1381.094, y=1610.255, z=327.927)"
-                    ],
+                    "collisions_layout": [],
                     "collisions_pedestrian": [],
                     "collisions_vehicle": [],
                     "red_light": [],
-                    "stop_infraction": [],
-                    "outside_route_lanes": [
-                        "Agent went outside its route lanes for about 10.001 meters (2.57% of the completed route)"
+                    "stop_infraction": [
+                        "Agent ran a stop with id=15518 at (x=-3671.567, y=1155.606, z=348.958)"
                     ],
-                    "min_speed_infractions": [],
+                    "outside_route_lanes": [
+                        "Agent went outside its route lanes for about 4.226 meters (1.22% of the completed route)"
+                    ],
+                    "min_speed_infractions": [
+                        "Average speed is 98.9% of the surrounding traffic's one"
+                    ],
                     "yield_emergency_vehicles_infractions": [],
                     "scenario_timeouts": [],
                     "route_dev": [],
@@ -68,14 +69,14 @@
                     "route_timeout": []
                 },
                 "scores": {
-                    "score_route": 12.14,
-                    "score_penalty": 0.411643,
-                    "score_composed": 4.997345
+                    "score_route": 69.54,
+                    "score_penalty": 0.787619,
+                    "score_composed": 54.771049
                 },
                 "meta": {
-                    "route_length": 3206.913,
-                    "duration_game": 104.9,
-                    "duration_system": 226.389
+                    "route_length": 497.434,
+                    "duration_game": 117.4,
+                    "duration_system": 170.527
                 }
             }
         ]
@@ -91,21 +92,21 @@
         "carla_speedometer"
     ],
     "values": [
-        "4.997345",
-        "12.14",
-        "0.411643",
-        "0.0",
-        "0.0",
-        "5.137",
-        "0.0",
-        "0.0",
-        "0.01",
+        "54.771049",
+        "69.54",
+        "0.787619",
         "0.0",
         "0.0",
         "0.0",
         "0.0",
+        "2.891",
+        "0.004",
         "0.0",
-        "0.0"
+        "0.0",
+        "0.0",
+        "0.0",
+        "0.0",
+        "2.891"
     ],
     "labels": [
         "Avg. driving score",
