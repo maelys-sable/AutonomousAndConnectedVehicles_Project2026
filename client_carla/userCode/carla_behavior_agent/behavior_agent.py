@@ -46,6 +46,10 @@ class BehaviorAgent(BasicAgent):
         'vehicle.gazelle.omafiets',
     )
 
+    # Lateral clearance kept from a cyclist ahead (HazardAtSideLane), in
+    # metres. Small enough to stay well within the lane (~3.5 m wide).
+    CYCLIST_CLEARANCE_OFFSET = 0.5
+
     JUNCTION_STALL_EXCLUSION_DISTANCE = 25.0   
 
     BYPASS_DETECTION_DISTANCE = 80
@@ -128,6 +132,9 @@ class BehaviorAgent(BasicAgent):
 
         elif behavior == 'aggressive':
             self._behavior = Aggressive()
+
+        self._bypassing = False
+        self._bypassed_vehicle = None
 
         # Cycle : 'idle' -> 'waiting_gap' -> 'overtaking' -> 'returning' -> 'idle'
         self._bypass_state = 'idle'
@@ -294,6 +301,7 @@ class BehaviorAgent(BasicAgent):
         self._speed = get_speed(self._vehicle)
         self._speed_limit = self._vehicle.get_speed_limit()
         self._local_planner.set_speed(self._speed_limit)
+        self._local_planner.set_offset(0)
         self._direction = self._local_planner.target_road_option
         if self._direction is None:
             self._direction = RoadOption.LANEFOLLOW
@@ -537,28 +545,32 @@ class BehaviorAgent(BasicAgent):
 
         return any(keyword in actor.type_id for keyword in self.CYCLIST_TYPE_KEYWORDS)
 
-    def _cyclist_ahead(self, waypoint):
+    def _update_cyclist_clearance(self, waypoint, vehicle):
+        """
+        Keeps a lateral gap from a cyclist ahead (HazardAtSideLane) by
+        offsetting the tracked line away from the cyclist's side, without
+        leaving the lane. Speed is still governed by car-following.
 
-        obstacle_list = self._build_obstacle_list(waypoint, max_distance=self.BYPASS_DETECTION_DISTANCE)
-        cyclist_list = [a for a in obstacle_list if self._is_cyclist(a)]
-        if not cyclist_list:
-            return False, None, -1
+        Uses the waypoint's own right vector as the sign basis (the same
+        basis the Stanley controller applies the offset in), so a cyclist
+        on the right (lateral > 0) produces a shift to the left, and vice
+        versa. Resets the offset to 0 when there is no cyclist to clear.
 
-        forward_state, forward_actor, forward_distance = self._vehicle_obstacle_detected(
-            cyclist_list, self.BYPASS_DETECTION_DISTANCE, up_angle_th=self._forward_detection_angle())
-        
-        _, lateral_actor, lateral_distance = self._vehicle_obstacle_detected(cyclist_list)
+            :param waypoint: the agent's current waypoint
+            :param vehicle: the lead obstacle detected ahead, or None
+        """
+        if vehicle is None or not self._is_cyclist(vehicle):
+            self._local_planner.set_offset(0)
+            return
 
-        if forward_state and lateral_actor is not None:
-            if forward_distance <= lateral_distance:
-                return True, forward_actor, forward_distance
-            return True, lateral_actor, lateral_distance
-        if forward_state:
-            return True, forward_actor, forward_distance
-        if lateral_actor is not None:
-            return True, lateral_actor, lateral_distance
-        return False, None, -1
+        r_vec = waypoint.transform.get_right_vector()
+        origin = waypoint.transform.location
+        loc = vehicle.get_location()
+        lateral = (loc.x - origin.x) * r_vec.x + (loc.y - origin.y) * r_vec.y
 
+        # Positive offset shifts right; move away from the cyclist's side.
+        offset = -self.CYCLIST_CLEARANCE_OFFSET if lateral > 0 else self.CYCLIST_CLEARANCE_OFFSET
+        self._local_planner.set_offset(offset)
 
     def _static_obstacle_ahead(self, waypoint):
 
@@ -641,11 +653,13 @@ class BehaviorAgent(BasicAgent):
     def _blocking_obstacle_ahead(self, waypoint):
         """
         Generic entry point for the bypass module. An overtake is only
-        ever justified by one of exactly three situations (user request):
+        ever justified by one of exactly two situations:
           1. a static obstacle (ConstructionObstacleTwoWays, roadworks...);
-          2. a cyclist ahead or beside (see `_cyclist_ahead`);
-          3. a vehicle confirmed genuinely stalled - NOT a car paused at a
+          2. a vehicle confirmed genuinely stalled - NOT a car paused at a
              stop sign/red light/pulling away (see `_stalled_vehicle_ahead`).
+        Cyclists (HazardAtSideLane) are intentionally excluded: they are
+        handled by car-following plus a lateral clearance offset (see
+        `_update_cyclist_clearance`), never overtaken.
         Anything else in front of the agent is plain car-following
         (`car_following_manager`), never a reason to change lane.
 
@@ -655,10 +669,6 @@ class BehaviorAgent(BasicAgent):
         static_state, static_obstacle, static_distance = self._static_obstacle_ahead(waypoint)
         if static_state:
             return static_state, static_obstacle, static_distance
-
-        cyclist_state, cyclist, cyclist_distance = self._cyclist_ahead(waypoint)
-        if cyclist_state:
-            return cyclist_state, cyclist, cyclist_distance
 
         return self._stalled_vehicle_ahead(waypoint)
 
@@ -1147,6 +1157,9 @@ class BehaviorAgent(BasicAgent):
 
         # 2.3: Car following behaviors
         vehicle_state, vehicle, distance = self.collision_and_car_avoid_manager(ego_vehicle_wp)
+
+        # Keep a lateral gap from a cyclist ahead without changing lane.
+        self._update_cyclist_clearance(ego_vehicle_wp, vehicle if vehicle_state else None)
 
         if vehicle_state:
             # Distance is computed from the center of the two cars,

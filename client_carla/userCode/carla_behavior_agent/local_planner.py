@@ -149,6 +149,17 @@ class LocalPlanner(object):
                   "Use 'follow_speed_limits' to deactivate this")
         self._target_speed = speed
 
+    def set_offset(self, offset):
+        """
+        Sets a live lateral offset (metres) from the lane center, forwarded
+        to the lateral controller. Positive shifts right, negative left.
+
+        :param offset: lateral offset in metres
+        :return:
+        """
+        self._offset = offset
+        self._vehicle_controller.set_offset(offset)
+
     def follow_speed_limits(self, value=True):
         """
         Activates a flag that makes the max speed dynamically vary according to the spped limits

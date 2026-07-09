@@ -104,6 +104,10 @@ class VehicleController():
     def setWaypoints(self, waypoints):
         self._lat_controller.setWaypoints(waypoints)
 
+    def set_offset(self, offset):
+        """Forwards a live lateral offset (metres) to the lateral controller."""
+        self._lat_controller.set_offset(offset)
+
 
 class PIDLongitudinalController():
     """
@@ -152,12 +156,6 @@ class PIDLongitudinalController():
         """
 
         error = target_speed - current_speed
-        if self._error_buffer:
-            previous_error = self._error_buffer[-1]
-            crossed_target = (previous_error > 0 and error <= 0) or (previous_error < 0 and error >= 0)
-            if crossed_target:
-                self._error_buffer.clear()
-
         self._error_buffer.append(error)
 
         if len(self._error_buffer) >= 2:
@@ -252,6 +250,12 @@ class StanleyLateralController():
         ce_idx = self._get_lookahead_index(ego_loc,self._lookahead_distance)
         desired_x = self._wps[ce_idx][0].transform.location.x
         desired_y = self._wps[ce_idx][0].transform.location.y
+
+        # Lateral offset support
+        if self._offset != 0:
+            r_vec = self._wps[ce_idx][0].transform.get_right_vector()
+            desired_x += self._offset * r_vec.x
+            desired_y += self._offset * r_vec.y
         
         # Get Target Heading
         if ce_idx < len(self._wps)-1:
@@ -298,6 +302,10 @@ class StanleyLateralController():
         self._kv = Kv
         self._ks = Ks
         self._dt = dt
+
+    def set_offset(self, offset):
+        """Sets the lateral offset (metres) from the lane center, live."""
+        self._offset = offset
     
     def setWaypoints(self, wps):
         """Sets trajectory to follow and filters spurious points"""
