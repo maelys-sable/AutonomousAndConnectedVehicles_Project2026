@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<routes>
+<route id="0" town="Town12">
+  <!-- ISOLATED TEST: HardBreakRoute | source instance: HardBreakRoute_2 (idx 11)
+       sudden braking by the leader — emergency_stop safety net -->
+  <weathers>
+	<weather route_percentage="0"
+		cloudiness="60.0" precipitation="30.0" precipitation_deposits="50.0" wetness="60.0"
+		wind_intensity="30.0" sun_azimuth_angle="-1.0" sun_altitude_angle="-90.0" fog_density="3.0"/>
+	<weather route_percentage="100"
+		cloudiness="60.0" precipitation="30.0" precipitation_deposits="50.0" wetness="60.0"
+		wind_intensity="30.0" sun_azimuth_angle="-1.0" sun_altitude_angle="-90.0" fog_density="3.0"/>
+  </weathers>
+  <waypoints>
+	 <position x="-2594.6" y="855.2" z="313.2"/>
+	 <position x="-2748.6" y="833.4" z="313.7"/>
+	 <position x="-2863.3" y="783.3" z="316.3"/>
+	 <position x="-2867.1" y="749.1" z="315.0"/>
+	 <position x="-2834.0" y="662.5" z="311.5"/>
+  </waypoints>
+  <scenarios>
+	 <scenario name="HardBreakRoute_2" type="HardBreakRoute">
+		<trigger_point x="-2863.3" y="783.3" z="316.3" yaw="251.5"/></scenario>
+  </scenarios>
+</route>
+</routes>
