@@ -236,7 +236,7 @@ class BehaviorAgent(BasicAgent):
         obstacle_info = f" obstacle={obstacle.type_id}(id={obstacle.id})" if obstacle is not None else ""
         messages = {
             'detected': f"[BYPASS] Obstacle detected{pos}{obstacle_info} -> searching for a gap",
-            'gap_found': f"[BYPASS] Gap found{pos} -> start of manoeuvre",
+            'gap_found': f"[BYPASS] Gap found{pos}{obstacle_info} -> start of manoeuvre",
             'success': f"[BYPASS] TEST SUCCESSFUL: obstacle bypassed, back on track{pos}",
             'timeout': f"[BYPASS] TEST FAILED: manoeuvre timed out{pos}"
                        f"(stuck in '{self._bypass_state}')",
@@ -675,6 +675,10 @@ class BehaviorAgent(BasicAgent):
         if static_state:
             return static_state, static_obstacle, static_distance
 
+        # Cyclists (HazardAtSideLane) are deliberately NOT bypassed here.
+        # They are handled as a slow lead vehicle by car-following, plus a
+        # lateral clearance offset (see _update_cyclist_clearance), per the
+        # route plan (slow down + keep spacing, never overtake into oncoming).
         return self._stalled_vehicle_ahead(waypoint)
 
     def _oncoming_lane_obstacle(self, waypoint):
@@ -753,6 +757,31 @@ class BehaviorAgent(BasicAgent):
         self._stalled_tick_counter = 0
         self._ego_blocked_tick_counter = 0
 
+    def _try_lane_change(self, direction):
+        """
+        Like BasicAgent.lane_change, but only commits the new plan if a valid
+        path was actually found. BasicAgent.lane_change sets an empty plan when
+        no path exists, which then crashes the controller (empty waypoint
+        queue -> IndexError). This guard prevents that.
+
+            :param direction: 'left' or 'right'
+            :return: True if a lane-change path was found and applied
+        """
+        speed = self._vehicle.get_velocity().length()
+        path = self._generate_lane_change_path(
+            self._map.get_waypoint(self._vehicle.get_location()),
+            direction,
+            0,            # same-lane distance
+            0,            # other-lane distance
+            2 * speed,    # lane-change distance
+            False,        # check
+            1,            # number of lane changes
+            self._sampling_resolution)
+        if not path:
+            return False
+        self.set_global_plan(path)
+        return True
+
     def bypass_obstacle_manager(self, waypoint):
         """
         Decide whether an overtake of a blocking obstacle should be started,
@@ -778,23 +807,29 @@ class BehaviorAgent(BasicAgent):
             if not self._oncoming_gap_clear(waypoint):
                 return True
 
+            # Only commit to the manoeuvre if a lane-change path exists.
+            if not self._try_lane_change("left"):
+                return True
+
             self._log_bypass_transition('gap_found', waypoint, obstacle)
             self._bypassing = True
             self._bypassed_vehicle = obstacle
             self._bypass_start_tick = self._tick_count
-            self.lane_change("left")
             return True
 
         # Currently overtaking.
         if self._obstacle_cleared():
-            self._log_bypass_transition('success', waypoint)
-            self.lane_change("right")
-            self._reset_bypass_state()
-            return False
+            if self._try_lane_change("right"):
+                self._log_bypass_transition('success', waypoint)
+                self._reset_bypass_state()
+                return False
+            # No return path yet: stay the course and retry next tick rather
+            # than crashing on an empty plan.
+            return True
 
         if self._bypass_timed_out():
+            self._try_lane_change("right")   # best effort, ignore failure
             self._log_bypass_transition('timeout', waypoint)
-            self.lane_change("right")
             self._reset_bypass_state()
             return False
 
@@ -989,9 +1024,9 @@ class BehaviorAgent(BasicAgent):
 
     def _in_bypass_maneuver_grace_period(self):
 
-        if self._bypass_state == 'idle' or self._last_bypass_transition_tick is None:
+        if not self._bypassing or self._bypass_start_tick is None:
             return False
-        return (self._tick_count - self._last_bypass_transition_tick) <= self.CONTROL_LOSS_BYPASS_GRACE_TICKS
+        return (self._tick_count - self._bypass_start_tick) <= self.CONTROL_LOSS_BYPASS_GRACE_TICKS
 
     def _control_loss_detected(self, waypoint):
 
