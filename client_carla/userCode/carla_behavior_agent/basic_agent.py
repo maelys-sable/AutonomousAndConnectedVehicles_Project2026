@@ -27,6 +27,8 @@ class BasicAgent(object):
     as well as to change its parameters in case a different driving mode is desired.
     """
 
+    STOP_SIGN_BASE_THRESHOLD = 5.0      
+
     def __init__(self, vehicle, opt_dict={}, map_inst=None, grp_inst=None):
         """
         Initialization the agent paramters, the local and the global planner.
@@ -314,6 +316,54 @@ class BasicAgent(object):
                 return (True, traffic_light)
 
         return (False, None)
+
+    def _affected_by_stop_sign(self, stops_list=None, max_distance=None):
+            """
+                Method to check if there is a stop sign affecting the vehicle.
+
+                :param stops_list: carla stop-sign actors (queried if None)
+                :param max_distance: detection distance (speed-scaled default if None)
+                :return: (True, stop_sign) if a stop sign affects the ego, else (False, None)
+            """
+            if self._ignore_stop_signs:
+                return (False, None)
+
+            if stops_list is None:
+                actor_list = self._actors if self._actors is not None else self._world.get_actors()
+                stops_list = actor_list.filter("*stop*")
+
+            if max_distance is None:
+                max_distance = self.STOP_SIGN_BASE_THRESHOLD + self._speed_ratio * (self._speed / 3.6)
+
+            ego_location = self._vehicle.get_location()
+            ego_waypoint = self._map.get_waypoint(ego_location)
+
+            for stop_sign in stops_list:
+                if stop_sign.id in self._stop_map:
+                    trigger_wp = self._stop_map[stop_sign.id]
+                else:
+                    trigger_location = stop_sign.get_transform().transform(
+                        stop_sign.trigger_volume.location)
+                    trigger_wp = self._map.get_waypoint(trigger_location)
+                    self._stop_map[stop_sign.id] = trigger_wp
+
+                if trigger_wp.transform.location.distance(ego_location) > max_distance:
+                    continue
+
+                if trigger_wp.road_id != ego_waypoint.road_id:
+                    continue
+
+                ve_dir = ego_waypoint.transform.get_forward_vector()
+                wp_dir = trigger_wp.transform.get_forward_vector()
+                dot_ve_wp = ve_dir.x * wp_dir.x + ve_dir.y * wp_dir.y + ve_dir.z * wp_dir.z
+                if dot_ve_wp < 0:
+                    continue  # sign faces the other way (opposite lane)
+
+                if is_within_distance(trigger_wp.transform, self._vehicle.get_transform(),
+                                    max_distance, [0, 90]):
+                    return (True, stop_sign)
+
+            return (False, None)
 
     def _vehicle_obstacle_detected_old(self, vehicle_list=None, max_distance=None, up_angle_th=90, low_angle_th=0, lane_offset=0):
         """
