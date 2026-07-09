@@ -66,6 +66,16 @@ class BehaviorAgent(BasicAgent):
     JUNCTION_MIN_GAP_TIME = 3.0
     JUNCTION_TIMEOUT_TICKS = 300
 
+    # Stop-sign compliance (ACV guide §5.2 + Route1 plan §4.4 "non-blocage
+    # indéfini"). The base BasicAgent explicitly *ignores* stop signs, so the
+    # baseline scores "stop sign violation" infractions. A stop sign requires a
+    # single, brief *full* stop then proceeding - unlike a red light, which
+    # keeps the agent stopped for as long as it is red. The manager therefore
+    # registers exactly one full stop per sign and clears it, so the agent
+    # never freezes indefinitely at a stop sign.
+    STOP_SIGN_BASE_THRESHOLD = 5.0      # m, base detection distance (speed-scaled)
+    STOP_SIGN_SPEED_EPSILON = 0.5       # km/h, at/below this the ego counts as fully stopped
+
     STALL_SPEED_THRESHOLD = 1.0    
     STALL_TIMEOUT_TICKS = 150      
     EGO_BLOCKED_SPEED_THRESHOLD = 2.0    
@@ -150,6 +160,16 @@ class BehaviorAgent(BasicAgent):
         # Cycle : 'idle' -> 'waiting_clear' -> 'crossing' -> 'idle'
         self._junction_state = 'idle'
         self._junction_start_tick = None
+
+        # Stop-sign state (see stop_sign_manager). `_target_stop_sign` is the
+        # sign currently being serviced; `_stop_sign_done_id` is the sign we
+        # have already completed a full stop for while still inside its trigger
+        # zone (so we proceed instead of re-stopping and freezing).
+        # `_stop_map` caches each sign's (static) trigger waypoint, mirroring
+        # the base agent's `_lights_map`.
+        self._target_stop_sign = None
+        self._stop_sign_done_id = None
+        self._stop_map = {}
 
         # Stalled-vehicle tracking (see STALL_TIMEOUT_TICKS)
         self._stalled_vehicle_id = None
@@ -311,6 +331,120 @@ class BehaviorAgent(BasicAgent):
         affected, _ = self._affected_by_traffic_light(lights_list)
 
         return affected
+
+    def _affected_by_stop_sign(self, stops_list=None, max_distance=None):
+        """
+        Stop-sign counterpart of `_affected_by_traffic_light`, which the base
+        BasicAgent deliberately omits ("respects traffic lights and other
+        vehicles, but ignores stop signs"). Detects the stop sign whose trigger
+        area the ego is entering, on the same road and ahead of the vehicle.
+
+        Only reports *whether* a sign is relevant; the full-stop-then-go policy
+        lives in `stop_sign_manager`, exactly as red-light policy lives in
+        `traffic_light_manager` rather than here.
+
+            :param stops_list: carla stop-sign actors (queried if None)
+            :param max_distance: detection distance (speed-scaled default if None)
+            :return: (True, stop_sign) if a stop sign affects the ego, else (False, None)
+        """
+        if self._ignore_stop_signs:
+            return (False, None)
+
+        if stops_list is None:
+            actor_list = self._actors if self._actors is not None else self._world.get_actors()
+            stops_list = actor_list.filter("*stop*")
+
+        if max_distance is None:
+            max_distance = self.STOP_SIGN_BASE_THRESHOLD + self._speed_ratio * (self._speed / 3.6)
+
+        ego_location = self._vehicle.get_location()
+        ego_waypoint = self._map.get_waypoint(ego_location)
+
+        for stop_sign in stops_list:
+            if stop_sign.id in self._stop_map:
+                trigger_wp = self._stop_map[stop_sign.id]
+            else:
+                # Stop signs are static, so the trigger waypoint is cached once.
+                trigger_location = stop_sign.get_transform().transform(
+                    stop_sign.trigger_volume.location)
+                trigger_wp = self._map.get_waypoint(trigger_location)
+                self._stop_map[stop_sign.id] = trigger_wp
+
+            if trigger_wp.transform.location.distance(ego_location) > max_distance:
+                continue
+
+            if trigger_wp.road_id != ego_waypoint.road_id:
+                continue
+
+            ve_dir = ego_waypoint.transform.get_forward_vector()
+            wp_dir = trigger_wp.transform.get_forward_vector()
+            dot_ve_wp = ve_dir.x * wp_dir.x + ve_dir.y * wp_dir.y + ve_dir.z * wp_dir.z
+            if dot_ve_wp < 0:
+                continue  # sign faces the other way (opposite lane)
+
+            if is_within_distance(trigger_wp.transform, self._vehicle.get_transform(),
+                                  max_distance, [0, 90]):
+                return (True, stop_sign)
+
+        return (False, None)
+
+    def stop_sign_manager(self):
+        """
+        Enforces a single full stop at each stop sign, then proceeds - the
+        compliance the base agent lacks (source of the "stop sign violation"
+        infractions in the baseline). Unlike a red light, a stop sign must not
+        hold the agent indefinitely: once a genuine full stop has been
+        registered for a given sign, the agent is cleared to go even while
+        still physically inside the trigger zone ("non-blocage indéfini").
+
+            :return: True if the agent must remain stopped for a stop sign,
+                     False if it may proceed (no sign, or stop already made)
+        """
+        affected, stop_sign = self._affected_by_stop_sign()
+
+        if not affected:
+            # Left the trigger zone: re-arm for the next (or same) sign.
+            self._target_stop_sign = None
+            self._stop_sign_done_id = None
+            return False
+
+        # Already completed a full stop for this sign while still near it.
+        if stop_sign.id == self._stop_sign_done_id:
+            return False
+
+        self._target_stop_sign = stop_sign.id
+
+        if get_speed(self._vehicle) < self.STOP_SIGN_SPEED_EPSILON:
+            # Full stop achieved -> register it and release the agent.
+            self._stop_sign_done_id = stop_sign.id
+            self._target_stop_sign = None
+            self._log_stop_sign_transition('cleared', stop_sign)
+            return False
+
+        self._log_stop_sign_transition('stopping', stop_sign)
+        return True
+
+    def _log_stop_sign_transition(self, event, stop_sign=None):
+        """
+        Single entry point for stop-sign log messages, mirroring
+        `_log_junction_transition` so the three "non-blocage indéfini"
+        mechanisms (bypass, junction, stop sign) stay uniformly greppable.
+
+            :param event: 'stopping' (approaching, braking) or 'cleared' (stop done)
+            :param stop_sign: the stop-sign actor involved (optional)
+        """
+        sid = f" id={stop_sign.id}" if stop_sign is not None else ""
+        messages = {
+            'stopping': f"[STOP] Stop sign ahead{sid} -> braking to a full stop",
+            'cleared':  f"[STOP] Full stop registered{sid} -> proceeding",
+        }
+        msg = messages.get(event)
+        if msg is None:
+            return
+        # Throttle the repetitive 'stopping' spam; always print the one-shot 'cleared'.
+        if event == 'stopping' and (self._tick_count % self.STATE_LOG_INTERVAL) != 0:
+            return
+        print(msg)
 
 #----------------------------------------------------------------------------------------------#
 
@@ -1816,9 +1950,13 @@ class BehaviorAgent(BasicAgent):
         ego_vehicle_wp = self._map.get_waypoint(ego_vehicle_loc)
         self._log_vehicle_state(ego_vehicle_wp)
 
-        # 1: Red lights and stops behavior
+        # 1: Red lights behavior
         if self.traffic_light_manager():
             return self.emergency_stop()
+
+        # 1b: Stop-sign compliance
+        if self.stop_sign_manager():
+            return self._hold_position(debug=debug)
 
         # 2.1: Pedestrian avoidance behaviors
         walker_state, walker, w_distance = self.pedestrian_avoid_manager(ego_vehicle_wp)
