@@ -133,6 +133,9 @@ class BehaviorAgent(BasicAgent):
         elif behavior == 'aggressive':
             self._behavior = Aggressive()
 
+        # Minimal bypass flags (the full bypass rework is handled separately).
+        # These must exist so run_step's bypass step doesn't raise before the
+        # tick can reach the car-following / cyclist-clearance logic.
         self._bypassing = False
         self._bypassed_vehicle = None
 
@@ -301,6 +304,8 @@ class BehaviorAgent(BasicAgent):
         self._speed = get_speed(self._vehicle)
         self._speed_limit = self._vehicle.get_speed_limit()
         self._local_planner.set_speed(self._speed_limit)
+        # Default to no lateral offset each tick; the cyclist-clearance logic
+        # re-applies one only when a cyclist is detected ahead.
         self._local_planner.set_offset(0)
         self._direction = self._local_planner.target_road_option
         if self._direction is None:
@@ -509,7 +514,7 @@ class BehaviorAgent(BasicAgent):
             actor.bounding_box.extent.y, actor.bounding_box.extent.x) - max(
                 self._vehicle.bounding_box.extent.y, self._vehicle.bounding_box.extent.x)
 
-    def _react_to_moving_obstacle(self, waypoint, debug=False, ignore_actor_id=None):
+    def _react_to_moving_obstacle(self, waypoint, debug=False):
 
         vehicle_state, vehicle, distance = self.collision_and_car_avoid_manager(waypoint)
         if not vehicle_state:
@@ -699,23 +704,19 @@ class BehaviorAgent(BasicAgent):
         time_to_arrival = oncoming_distance / speed_ms
         return time_to_arrival >= min_gap_time
 
-    def _can_start_bypass(self, waypoint):
+    def _oncoming_gap_clear(self, waypoint):
+        """
+        Gap acceptance before pulling into the opposite (left) lane to
+        bypass an obstacle: returns True only if no oncoming vehicle is
+        close enough to make the manoeuvre unsafe.
 
-        left_lane = waypoint.get_left_lane()
-
-        if left_lane is None:
-            return False
-
-        if left_lane.lane_type != carla.LaneType.Driving:
-            return False
-
-        obstacle, _, _ = self._vehicle_obstacle_detected(
-            lane_offset=1,
-            max_distance=30,
-            up_angle_th=90
-        )
-
-        return not obstacle
+            :param waypoint: the agent's current waypoint
+            :return: True if it is safe to move into the oncoming lane
+        """
+        oncoming_state, oncoming_vehicle, oncoming_distance = self._oncoming_lane_obstacle(waypoint)
+        if not oncoming_state:
+            return True
+        return self._gap_is_safe(oncoming_distance, get_speed(oncoming_vehicle))
 
     def _obstacle_cleared(self):
 
@@ -738,6 +739,8 @@ class BehaviorAgent(BasicAgent):
 
     def _reset_bypass_state(self):
 
+        self._bypassing = False
+        self._bypassed_vehicle = None
         self._bypass_state = 'idle'
         self._bypass_origin_waypoint = None
         self._bypass_start_tick = None
@@ -752,25 +755,50 @@ class BehaviorAgent(BasicAgent):
 
     def bypass_obstacle_manager(self, waypoint):
         """
-        Decide whether an overrun should be started or ended.
+        Decide whether an overtake of a blocking obstacle should be started,
+        continued, or ended.
+
+            :param waypoint: the agent's current waypoint
+            :return: True if the bypass module is handling this tick (run_step
+                should defer to it), False otherwise.
         """
-
         if not self._bypassing:
-            obstacle = self._blocking_obstacle_ahead(waypoint)
-            if obstacle is None:
-                return
+            obstacle_state, obstacle, _ = self._blocking_obstacle_ahead(waypoint)
+            if not obstacle_state:
+                return False
 
-            if self._can_start_bypass(waypoint):
-                print("Starting bypass")
-                self._bypassing = True
-                self._bypassed_vehicle = obstacle
-                self.lane_change("left")
-            return
+            # The overtake uses the opposite (left) lane on a two-way road.
+            left_lane = waypoint.get_left_lane()
+            if left_lane is None or left_lane.lane_type != carla.LaneType.Driving:
+                # No usable opposite lane: leave it to car-following/braking.
+                return False
 
+            # Gap acceptance: wait behind the obstacle until the oncoming
+            # lane is clear enough, instead of pulling out into traffic.
+            if not self._oncoming_gap_clear(waypoint):
+                return True
+
+            self._log_bypass_transition('gap_found', waypoint, obstacle)
+            self._bypassing = True
+            self._bypassed_vehicle = obstacle
+            self._bypass_start_tick = self._tick_count
+            self.lane_change("left")
+            return True
+
+        # Currently overtaking.
         if self._obstacle_cleared():
-            print("Returning to original lane")
+            self._log_bypass_transition('success', waypoint)
             self.lane_change("right")
             self._reset_bypass_state()
+            return False
+
+        if self._bypass_timed_out():
+            self._log_bypass_transition('timeout', waypoint)
+            self.lane_change("right")
+            self._reset_bypass_state()
+            return False
+
+        return True
 
 #----------------------------------------------------------------------------------------------#
 #   JUNCTION
@@ -1143,9 +1171,9 @@ class BehaviorAgent(BasicAgent):
 
         # 2.2: Static obstacle bypass behavior (construction/accident/parked vehicle)
         if self.bypass_obstacle_manager(ego_vehicle_wp):
-            blocking_control = self._react_to_moving_obstacle(
-                ego_vehicle_wp, debug=debug,
-                ignore_actor_id=self._bypass_target_actor.id if self._bypass_target_actor is not None else None)
+            # The obstacle being overtaken is ignored inside
+            # _react_to_moving_obstacle via _should_ignore_vehicle.
+            blocking_control = self._react_to_moving_obstacle(ego_vehicle_wp, debug=debug)
             if blocking_control is not None:
                 return blocking_control
 
