@@ -46,8 +46,6 @@ class BehaviorAgent(BasicAgent):
         'vehicle.gazelle.omafiets',
     )
 
-    # Lateral clearance kept from a cyclist ahead (HazardAtSideLane), in
-    # metres. Small enough to stay well within the lane (~3.5 m wide).
     CYCLIST_CLEARANCE_OFFSET = 0.5
 
     JUNCTION_STALL_EXCLUSION_DISTANCE = 25.0   
@@ -56,9 +54,15 @@ class BehaviorAgent(BasicAgent):
     BYPASS_MIN_GAP_TIME = 4.0
     BYPASS_LANE_OVERLAP_MARGIN = 0.3
 
-    # Adaptive lateral-offset overtake (vehicle obstacles on two-way roads).
-    # The ego shifts laterally by only what is needed to clear the obstacle,
-    # instead of a full lane change, to limit exposure in the oncoming lane.
+    CONSTR_DETECTION_DISTANCE = 80
+    CONSTR_CLUSTER_GAP = 12.0        
+    CONSTR_CLEAR_MARGIN = 2.0        
+    CONSTR_EXIT_MARGIN = 4.0         
+    CONSTR_PASS_SPEED_KMH = 25.0  
+    CONSTR_GAP_SAFETY_BUFFER = 2.0  
+    CONSTR_MAX_OFFSET = 3.5          
+    CONSTR_SAFETY_STOP_LONG = 6.0    
+
     BYPASS_LATERAL_CLEARANCE = 0.5       # extra side gap kept from the obstacle (m)
     BYPASS_MAX_OFFSET = 2.5              # beyond this, fall back to a full lane change (m)
     BYPASS_CLEAR_LONG_MARGIN = 5.0       # obstacle counts as passed once this far behind (m)
@@ -162,6 +166,11 @@ class BehaviorAgent(BasicAgent):
 
         self._bypass_use_offset = False
         self._bypass_offset = 0.0
+
+        self._constr_state = 'idle'
+        self._constr_zone_actors = []
+        self._constr_offset = 0.0
+        self._constr_start_tick = None
 
         self._actors = None
 
@@ -272,6 +281,24 @@ class BehaviorAgent(BasicAgent):
             self._scenario_result = False
         # 'resumed_normal' and 'cyclist_gone' are correct self-diagnoses, not scenario
         # failures - they deliberately leave self._scenario_result untouched.
+
+    def _log_construction_transition(self, event, waypoint=None):
+
+        loc = waypoint.transform.location if waypoint is not None else None
+        pos = f" pos=({loc.x:.1f}, {loc.y:.1f})" if loc is not None else ""
+        n = len(self._constr_zone_actors)
+        messages = {
+            'gap_found': f"[CONSTR] Gap found{pos} -> entering construction zone "
+                         f"({n} props, offset={self._constr_offset:.2f}m) start of manoeuvre",
+            'success': f"[CONSTR] TEST SUCCESSFUL: construction zone cleared, back on track{pos}",
+            'timeout': f"[CONSTR] TEST FAILED: manoeuvre timed out{pos} "
+                       f"(stuck in '{self._constr_state}')",
+        }
+        print(messages[event])
+        if event == 'success':
+            self._scenario_result = True
+        elif event == 'timeout':
+            self._scenario_result = False
 
     def _log_junction_transition(self, event, waypoint=None):
 
@@ -965,6 +992,181 @@ class BehaviorAgent(BasicAgent):
         return True
 
 #----------------------------------------------------------------------------------------------#
+# CONSTRUCTION ZONE
+#----------------------------------------------------------------------------------------------#
+
+    def _construction_props_ahead(self, waypoint):
+        props = []
+
+        for actor in self._build_obstacle_list(waypoint, max_distance=self.CONSTR_DETECTION_DISTANCE):
+            if "static.prop" not in actor.type_id:
+                continue
+            longitudinal, _ = self._road_projection(actor, waypoint)
+            if longitudinal <= 0:
+                continue
+            if not self._is_obstacle_in_lane(actor, waypoint):
+                continue
+            props.append((actor, longitudinal))
+
+        props.sort(key=lambda p: p[1])
+        return props
+
+    def _build_construction_zone(self, waypoint):
+
+        props = self._construction_props_ahead(waypoint)
+
+        if not props:
+            return None
+        
+        cluster = [props[0]]
+        for actor, longitudinal in props[1:]:
+            if longitudinal - cluster[-1][1] > self.CONSTR_CLUSTER_GAP:
+                break
+            cluster.append((actor, longitudinal))
+
+        return {
+            'actors': [a for a, _ in cluster],
+            'start': cluster[0][1],
+            'end': cluster[-1][1],
+        }
+
+    def _prop_lane_lateral(self, prop):
+
+        prop_wp = self._map.get_waypoint(prop.get_location())
+        _, lateral = self._road_projection(prop, prop_wp)
+        half_width = max(prop.bounding_box.extent.x, prop.bounding_box.extent.y)
+
+        return lateral, half_width, prop_wp.lane_width
+
+    def _ego_half_width(self):
+
+        return max(self._vehicle.bounding_box.extent.x, self._vehicle.bounding_box.extent.y)
+
+    def _zone_offset(self, zone):
+
+        ego_half = self._ego_half_width()
+        needed = 0.0
+
+        for prop in zone['actors']:
+            lateral, half_width, _ = self._prop_lane_lateral(prop)
+            limit = lateral - half_width - ego_half - self.CONSTR_CLEAR_MARGIN
+            needed = min(needed, limit)
+
+        return max(needed, -self.CONSTR_MAX_OFFSET)
+
+    def _zone_pass_duration(self, zone):
+
+        ego_length = 2 * self._vehicle.bounding_box.extent.x
+        length = (zone['end'] - zone['start']) + ego_length + 2 * self.CONSTR_EXIT_MARGIN
+        speed_ms = self.CONSTR_PASS_SPEED_KMH / 3.6
+        return length / max(speed_ms, 0.1)
+
+    def _zone_gap_clear(self, waypoint, zone):
+
+        state, oncoming, distance = self._oncoming_lane_obstacle(waypoint)
+
+        if not state:
+            return True
+
+        required = self._zone_pass_duration(zone) + self.CONSTR_GAP_SAFETY_BUFFER
+        speed_ms = get_speed(oncoming) / 3.6
+
+        if speed_ms <= 0:
+            return True
+
+        safe = (distance / speed_ms) >= required
+        print(
+            f"[CONSTR] Oncoming check: {oncoming.type_id}(id={oncoming.id}) "
+            f"dist={distance:.1f}m speed={get_speed(oncoming):.1f}km/h "
+            f"required_gap={required:.1f}s -> {'CLEAR, entering' if safe else 'BLOCKED, yielding'}"
+        )
+        return safe
+
+    def _zone_passed(self, waypoint):
+
+        rear = self._vehicle.bounding_box.extent.x + self.CONSTR_EXIT_MARGIN
+
+        for prop in self._constr_zone_actors:
+            longitudinal, _ = self._road_projection(prop, waypoint)
+
+            if longitudinal > -rear:
+                return False
+
+        return True
+
+    def _zone_safety_stop_needed(self, waypoint):
+
+        ego_half = self._ego_half_width()
+        ego_left = self._constr_offset - ego_half
+        ego_right = self._constr_offset + ego_half
+
+        for prop in self._constr_zone_actors:
+            longitudinal, _ = self._road_projection(prop, waypoint)
+            if longitudinal < -ego_half or longitudinal > self.CONSTR_SAFETY_STOP_LONG:
+                continue
+            lateral, half_width, _ = self._prop_lane_lateral(prop)
+            prop_left = lateral - half_width
+            prop_right = lateral + half_width
+            overlap = not (ego_right < prop_left or ego_left > prop_right)
+
+            if overlap:
+                return True
+
+        return False
+
+    def _reset_construction_state(self):
+
+        self._constr_state = 'idle'
+        self._constr_zone_actors = []
+        self._constr_offset = 0.0
+        self._constr_start_tick = None
+
+    def construction_zone_manager(self, waypoint, debug=False):
+
+        if self._constr_state == 'idle':
+            zone = self._build_construction_zone(waypoint)
+            if zone is None:
+                return None
+
+            left_lane = waypoint.get_left_lane()
+
+            if left_lane is None or left_lane.lane_type != carla.LaneType.Driving:
+                return None
+            
+            self._local_planner.set_offset(0)
+            if not self._zone_gap_clear(waypoint, zone):
+                return self._hold_position(debug=debug)
+
+            self._constr_zone_actors = zone['actors']
+            self._constr_offset = self._zone_offset(zone)
+            self._constr_state = 'passing'
+            self._constr_start_tick = self._tick_count
+            self._log_construction_transition('gap_found', waypoint)
+
+        # passing
+        if self._zone_passed(waypoint):
+            self._local_planner.set_offset(0)
+            self._log_construction_transition('success', waypoint)
+            self._reset_construction_state()
+            return None
+
+        if (self._tick_count - self._constr_start_tick) > self.BYPASS_TIMEOUT_TICKS:
+            self._local_planner.set_offset(0)
+            self._log_construction_transition('timeout', waypoint)
+            self._reset_construction_state()
+            return None
+        
+        self._local_planner.set_offset(self._constr_offset)
+
+        if self._zone_safety_stop_needed(waypoint):
+            return self.emergency_stop()
+
+        target_speed = min(self.CONSTR_PASS_SPEED_KMH, self._behavior.max_speed)
+        self._local_planner.set_speed(self._clamp_to_speed_limit(target_speed))
+        return self._local_planner.run_step(debug=debug)
+
+
+#----------------------------------------------------------------------------------------------#
 #   JUNCTION
 #----------------------------------------------------------------------------------------------#
 
@@ -1394,6 +1596,11 @@ class BehaviorAgent(BasicAgent):
                 self._behavior.max_speed])
             self._local_planner.set_speed(self._clamp_to_speed_limit(target_speed))
             return self._local_planner.run_step(debug=debug)
+        
+        # 2.2a: Construction-zone bypass 
+        constr_control = self.construction_zone_manager(ego_vehicle_wp, debug=debug)
+        if constr_control is not None:
+            return constr_control
 
         # 2.2: Static obstacle bypass behavior (construction/accident/parked vehicle)
         if self.bypass_obstacle_manager(ego_vehicle_wp):
