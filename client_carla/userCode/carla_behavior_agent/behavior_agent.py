@@ -56,6 +56,14 @@ class BehaviorAgent(BasicAgent):
     BYPASS_MIN_GAP_TIME = 4.0
     BYPASS_LANE_OVERLAP_MARGIN = 0.3
 
+    # Adaptive lateral-offset overtake (vehicle obstacles on two-way roads).
+    # The ego shifts laterally by only what is needed to clear the obstacle,
+    # instead of a full lane change, to limit exposure in the oncoming lane.
+    BYPASS_LATERAL_CLEARANCE = 0.5       # extra side gap kept from the obstacle (m)
+    BYPASS_MAX_OFFSET = 2.5              # beyond this, fall back to a full lane change (m)
+    BYPASS_CLEAR_LONG_MARGIN = 5.0       # obstacle counts as passed once this far behind (m)
+    BYPASS_OVERTAKE_SPEED_FACTOR = 0.8   # speed reduction while the offset is applied
+
     BYPASS_ABORT_RESUME_SPEED_THRESHOLD = 8.0   
     BYPASS_ABORT_RESUME_TICKS = 40   
 
@@ -148,6 +156,12 @@ class BehaviorAgent(BasicAgent):
         self._bypass_target_resumed_tick_counter = 0  
         self._bypass_best_offset = None   
         self._bypass_best_offset_tick = None
+
+        # Adaptive-offset overtake: whether the current manoeuvre uses a
+        # lateral offset (True) or a full lane-change fallback (False), and
+        # the offset magnitude to re-apply each tick.
+        self._bypass_use_offset = False
+        self._bypass_offset = 0.0
 
         self._actors = None
 
@@ -714,19 +728,26 @@ class BehaviorAgent(BasicAgent):
 # BYPASS
 #----------------------------------------------------------------------------------------------#
 
-    def _gap_is_safe(self, oncoming_distance, oncoming_speed, min_gap_time=None):
-
+    def _gap_is_safe(self, oncoming_distance, oncoming_speed, min_gap_time=None,
+                     ego_speed=0.0):
+        """
+        :param ego_speed: the ego's own speed (km/h) closing on the hazard.
+            For a head-on oncoming vehicle the real time-to-contact depends on
+            the *closing* speed (ego + oncoming), not the oncoming vehicle's
+            speed alone. Junction callers leave this at 0 (cross-traffic
+            geometry, not head-on) to keep their behaviour unchanged.
+        """
         if min_gap_time is None:
             min_gap_time = self.BYPASS_MIN_GAP_TIME
 
         if oncoming_distance is None or oncoming_distance < 0:
             return True
 
-        speed_ms = oncoming_speed / 3.6
-        if speed_ms <= 0:
+        closing_speed_ms = (oncoming_speed + ego_speed) / 3.6
+        if closing_speed_ms <= 0:
             return True
 
-        time_to_arrival = oncoming_distance / speed_ms
+        time_to_arrival = oncoming_distance / closing_speed_ms
         return time_to_arrival >= min_gap_time
 
     def _oncoming_gap_clear(self, waypoint):
@@ -736,7 +757,8 @@ class BehaviorAgent(BasicAgent):
             return True
         
         oncoming_speed = get_speed(oncoming_vehicle)
-        safe = self._gap_is_safe(oncoming_distance, oncoming_speed)
+        safe = self._gap_is_safe(oncoming_distance, oncoming_speed,
+                                 ego_speed=self._speed)
         print(
             f"[BYPASS] Oncoming check: {oncoming_vehicle.type_id}(id={oncoming_vehicle.id}) "
             f"dist={oncoming_distance:.1f}m speed={oncoming_speed:.1f}km/h "
@@ -763,6 +785,28 @@ class BehaviorAgent(BasicAgent):
 
         return ego_loc.distance(obs_loc) > 15
 
+    def _compute_bypass_offset(self, obstacle, waypoint):
+
+        _, lateral = self._road_projection(obstacle, waypoint)
+        obstacle_half_width = max(obstacle.bounding_box.extent.x,
+                                  obstacle.bounding_box.extent.y)
+        ego_half_width = self._vehicle.bounding_box.extent.y
+
+        offset = lateral - obstacle_half_width - self.BYPASS_LATERAL_CLEARANCE - ego_half_width
+
+        if offset >= 0:
+            return 0.0
+        if abs(offset) > self.BYPASS_MAX_OFFSET:
+            return None
+        return offset
+
+    def _bypass_obstacle_passed(self, waypoint):
+        """True once the bypassed obstacle is behind the ego by a margin."""
+        if self._bypassed_vehicle is None:
+            return False
+        longitudinal, _ = self._road_projection(self._bypassed_vehicle, waypoint)
+        return longitudinal < -self.BYPASS_CLEAR_LONG_MARGIN
+
     def _reset_bypass_state(self):
 
         self._bypassing = False
@@ -775,6 +819,8 @@ class BehaviorAgent(BasicAgent):
         self._bypass_target_resumed_tick_counter = 0
         self._bypass_best_offset = None
         self._bypass_best_offset_tick = None
+        self._bypass_use_offset = False
+        self._bypass_offset = 0.0
         self._stalled_vehicle_id = None
         self._stalled_tick_counter = 0
         self._ego_blocked_tick_counter = 0
@@ -829,9 +875,14 @@ class BehaviorAgent(BasicAgent):
             if not self._oncoming_gap_clear(waypoint):
                 return True
 
-            # Only commit to the manoeuvre if a lane-change path exists.
-            if not self._try_lane_change("left"):
-                return True
+            offset = self._compute_bypass_offset(obstacle, waypoint)
+            if offset is None:
+                if not self._try_lane_change("left"):
+                    return True
+                self._bypass_use_offset = False
+            else:
+                self._bypass_use_offset = True
+                self._bypass_offset = offset
 
             self._log_bypass_transition('gap_found', waypoint, obstacle)
             self._bypassing = True
@@ -840,6 +891,17 @@ class BehaviorAgent(BasicAgent):
             return True
 
         # Currently overtaking.
+        if self._bypass_use_offset:
+            if self._bypass_obstacle_passed(waypoint):
+                self._log_bypass_transition('success', waypoint)
+                self._reset_bypass_state()
+                return False
+            if self._bypass_timed_out():
+                self._log_bypass_transition('timeout', waypoint)
+                self._reset_bypass_state()
+                return False
+            return True
+
         if self._obstacle_cleared():
             if self._try_lane_change("right"):
                 self._log_bypass_transition('success', waypoint)
@@ -1237,6 +1299,11 @@ class BehaviorAgent(BasicAgent):
             target_speed = min([
                 self._behavior.max_speed,
                 self._speed_limit - self._behavior.speed_lim_dist])
+
+            if self._bypassing and self._bypass_use_offset:
+                self._local_planner.set_offset(self._bypass_offset)
+                target_speed *= self.BYPASS_OVERTAKE_SPEED_FACTOR
+
             self._local_planner.set_speed(self._clamp_to_speed_limit(target_speed))
             return self._local_planner.run_step(debug=debug)
 
