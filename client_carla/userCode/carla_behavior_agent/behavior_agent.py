@@ -629,6 +629,16 @@ class BehaviorAgent(BasicAgent):
         ahead = wp.next(distance)
         return any(w.is_junction for w in ahead)
 
+    def _cyclist_ahead(self, waypoint):
+
+        obstacle_list = self._build_obstacle_list(waypoint, max_distance=self.BYPASS_DETECTION_DISTANCE)
+        cyclist_list = [o for o in obstacle_list if self._is_cyclist(o)]
+        state, cyclist, distance = self._vehicle_obstacle_detected(
+            cyclist_list, self.BYPASS_DETECTION_DISTANCE, up_angle_th=self.FORWARD_ANGLE_STRAIGHT)
+        if state and not self._is_obstacle_in_lane(cyclist, waypoint):
+            return False, None, -1
+        return state, cyclist, distance
+
     def _stalled_vehicle_ahead(self, waypoint):
 
         obstacle_list = self._build_obstacle_list(waypoint, max_distance=self.BYPASS_DETECTION_DISTANCE)
@@ -656,29 +666,15 @@ class BehaviorAgent(BasicAgent):
 
 
     def _blocking_obstacle_ahead(self, waypoint):
-        """
-        Generic entry point for the bypass module. An overtake is only
-        ever justified by one of exactly two situations:
-          1. a static obstacle (ConstructionObstacleTwoWays, roadworks...);
-          2. a vehicle confirmed genuinely stalled - NOT a car paused at a
-             stop sign/red light/pulling away (see `_stalled_vehicle_ahead`).
-        Cyclists (HazardAtSideLane) are intentionally excluded: they are
-        handled by car-following plus a lateral clearance offset (see
-        `_update_cyclist_clearance`), never overtaken.
-        Anything else in front of the agent is plain car-following
-        (`car_following_manager`), never a reason to change lane.
 
-            :param waypoint: the agent's current waypoint
-            :return: tuple (obstacle_state, obstacle, distance)
-        """
         static_state, static_obstacle, static_distance = self._static_obstacle_ahead(waypoint)
         if static_state:
             return static_state, static_obstacle, static_distance
+        
+        cyclist_state, cyclist, cyclist_distance = self._cyclist_ahead(waypoint)
+        if cyclist_state:
+            return cyclist_state, cyclist, cyclist_distance
 
-        # Cyclists (HazardAtSideLane) are deliberately NOT bypassed here.
-        # They are handled as a slow lead vehicle by car-following, plus a
-        # lateral clearance offset (see _update_cyclist_clearance), per the
-        # route plan (slow down + keep spacing, never overtake into oncoming).
         return self._stalled_vehicle_ahead(waypoint)
 
     def _oncoming_lane_obstacle(self, waypoint):
