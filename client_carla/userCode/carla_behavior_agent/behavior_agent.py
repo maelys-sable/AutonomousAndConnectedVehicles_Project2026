@@ -91,6 +91,12 @@ class BehaviorAgent(BasicAgent):
 
     STALL_VEHICLE_MOVED_SPEED_KMH = 5.0
 
+
+    PEDESTRIAN_PREDICTION_TIME = 2.5     
+    PEDESTRIAN_STOP_TTC = 1.0       
+    PEDESTRIAN_SLOWDOWN_TTC = 2.0   
+    PEDESTRIAN_LATERAL_MARGIN = 0.8    
+    PEDESTRIAN_FORWARD_MARGIN = 3.0    
     PEDESTRIAN_WAIT_TIMEOUT_TICKS = 200   
     PEDESTRIAN_STATIONARY_SPEED = 0.5     
     PEDESTRIAN_CREEP_SPEED = 5            
@@ -451,6 +457,18 @@ class BehaviorAgent(BasicAgent):
         dx, dy = loc.x - origin.x, loc.y - origin.y
         longitudinal = dx * forward[0] + dy * forward[1]
         lateral = dx * right[0] + dy * right[1]
+
+        return longitudinal, lateral
+    
+    def _road_velocity_projection(self, actor, waypoint):
+
+        yaw = math.radians(waypoint.transform.rotation.yaw)
+        forward = (math.cos(yaw), math.sin(yaw))
+        right = (-math.sin(yaw), math.cos(yaw))
+        vel = actor.get_velocity()
+        longitudinal = vel.x * forward[0] + vel.y * forward[1]
+        lateral = vel.x * right[0] + vel.y * right[1]
+
         return longitudinal, lateral
 
     def _lateral_hazard_ahead(self, waypoint):
@@ -1021,6 +1039,25 @@ class BehaviorAgent(BasicAgent):
     def _pedestrian_is_stationary(self, walker):
 
         return get_speed(walker) < self.PEDESTRIAN_STATIONARY_SPEED
+    
+    def _time_until_lane_crossing(self, walker, waypoint):
+
+        longitudinal, lateral = self._road_projection(walker, waypoint)
+        _, lateral_speed = self._road_velocity_projection(walker, waypoint)
+        half_lane = (waypoint.lane_width / 2 + self.PEDESTRIAN_LATERAL_MARGIN)
+
+        if abs(lateral) <= half_lane:
+            return 0.0
+
+        if lateral * lateral_speed > 0:
+            return None
+
+        if abs(lateral_speed) < 0.05:
+            return None
+
+        distance_to_lane = abs(lateral) - half_lane
+
+        return distance_to_lane / abs(lateral_speed)
 
     def _creep_past_pedestrian(self, debug=False):
         """
@@ -1036,30 +1073,52 @@ class BehaviorAgent(BasicAgent):
 
     def pedestrian_avoid_manager(self, waypoint):
         """
-        This module is in charge of warning in case of a collision
-        with any pedestrian.
+        Detects pedestrians that are actually on (or about to enter) the ego lane.
 
-            :param location: current location of the agent
-            :param waypoint: current waypoint of the agent
-            :return vehicle_state: True if there is a walker nearby, False if not
-            :return vehicle: nearby walker
-            :return distance: distance to nearby walker
+        Returns
+        -------
+        walker_state : bool
+            True if a pedestrian represents a hazard.
+        walker : carla.Actor | None
+            Closest hazardous pedestrian.
+        distance : float
+            Euclidean distance from ego to pedestrian.
         """
 
-        walker_list = self._actors.filter("*walker.pedestrian*")
-        def dist(w): return w.get_location().distance(waypoint.transform.location)
-        walker_list = [w for w in walker_list if dist(w) < self._collision_detection_range()]
+        ego_loc = self._vehicle.get_location()
 
-        if self._direction == RoadOption.CHANGELANELEFT:
-            walker_state, walker, distance = self._vehicle_obstacle_detected(walker_list, self._dynamic_forward_distance(max(
-                self._behavior.min_proximity_threshold, self._speed_limit / 2)), up_angle_th=90, lane_offset=-1)
-        elif self._direction == RoadOption.CHANGELANERIGHT:
-            walker_state, walker, distance = self._vehicle_obstacle_detected(walker_list, self._dynamic_forward_distance(max(
-                self._behavior.min_proximity_threshold, self._speed_limit / 2)), up_angle_th=90, lane_offset=1)
-        else:
-            walker_state, walker, distance = self._vehicle_obstacle_detected(walker_list, self._collision_detection_range(), up_angle_th=60)
+        best_walker = None
+        best_distance = float("inf")
+        best_ttc = float("inf")
 
-        return walker_state, walker, distance
+        for walker in self._actors.filter("*walker.pedestrian*"):
+            distance = compute_distance(ego_loc, walker.get_location())
+            if distance > self._collision_detection_range():
+                continue
+
+            longitudinal, lateral = self._road_projection(walker, waypoint)
+
+            # Ignore pedestrians behind us
+            if longitudinal < -2:
+                continue
+
+            ttc = self._time_until_lane_crossing(walker, waypoint)
+
+            if ttc is None:
+                continue
+
+            if ttc > self.PEDESTRIAN_PREDICTION_TIME:
+                continue
+
+            if distance < best_distance:
+                best_distance = distance
+                best_ttc = ttc
+                best_walker = walker
+
+        if best_walker is None:
+            return False, None, -1
+
+        return True, best_walker, best_ttc, best_distance
 
 #----------------------------------------------------------------------------------------------#
 # CONTROL LOSS
@@ -1257,27 +1316,20 @@ class BehaviorAgent(BasicAgent):
             return self._hold_position(debug=debug)
 
         # 2.1: Pedestrian avoidance behaviors
-        walker_state, walker, w_distance = self.pedestrian_avoid_manager(ego_vehicle_wp)
+        walker_state, walker, ttc, w_distance = self.pedestrian_avoid_manager(ego_vehicle_wp)
 
         if walker_state:
-            # Distance is computed from the center of the two cars,
-            # we use bounding boxes to calculate the actual distance
-            distance = w_distance - max(
-                walker.bounding_box.extent.y, walker.bounding_box.extent.x) - max(
-                    self._vehicle.bounding_box.extent.y, self._vehicle.bounding_box.extent.x)
-
-            # Emergency brake if the car is very close (distance threshold
-            # scales with current speed, see _effective_braking_distance).
-            if distance < self._effective_braking_distance():
-                self._update_pedestrian_wait_tracking(walker)
-                if self._pedestrian_wait_timed_out() and self._pedestrian_is_stationary(walker):
-                    self._log_pedestrian_wait_timeout(ego_vehicle_wp)
-                    blocking_control = self._react_to_moving_obstacle(ego_vehicle_wp, debug=debug)
-                    if blocking_control is not None:
-                        return blocking_control
-                    return self._creep_past_pedestrian(debug=debug)
+            self._update_pedestrian_wait_tracking(walker)
+            distance = (distance 
+                        - max(walker.bounding_box.extent.x, walker.bounding_box.extent.y)
+                        - max(self._vehicle.bounding_box.extent.x,self._vehicle.bounding_box.extent.y))
+            
+            if(ttc <= self.PEDESTRIAN_STOP_TTC or distance < self._effective_braking_distance()):
                 return self.emergency_stop()
-            self._update_pedestrian_wait_tracking(None)
+
+            elif ttc <= self.PEDESTRIAN_SLOWDOWN_TTC:
+                self._local_planner.set_speed(min(10,self._speed_limit))
+                return self._local_planner.run_step(debug=debug)
         else:
             self._update_pedestrian_wait_tracking(None)
 
