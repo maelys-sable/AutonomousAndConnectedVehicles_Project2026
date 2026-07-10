@@ -349,7 +349,7 @@ class BehaviorAgent(BasicAgent):
 
     def stop_sign_manager(self):
         """
-        Strict stop management: Mandatory full stop + delay + traffic scan.
+        Stop Management: Full stop + delay + targeted scan to the left.
         """
         affected, stop_sign = self._affected_by_stop_sign()
 
@@ -374,17 +374,30 @@ class BehaviorAgent(BasicAgent):
 
         if self._stop_sign_ticks_frozen < 60:
             return True
-        
-        ego_loc = self._vehicle.get_location()
-        scan_distance = 50.0
+
+        ego_transform = self._vehicle.get_transform()
+        ego_loc = ego_transform.location
+        ego_fwd = ego_transform.get_forward_vector()
+
+        scan_distance = 45.0
         obstacle_list = self._build_obstacle_list(self._map.get_waypoint(ego_loc), max_distance=scan_distance)
 
         for actor in obstacle_list:
             if actor.id == self._vehicle.id or "vehicle" not in actor.type_id:
                 continue
             
-            if get_speed(actor) > 2.0:
-                return True
+            target_loc = actor.get_location()
+            distance = ego_loc.distance(target_loc)
+
+            to_target = target_loc - ego_loc
+
+            dot_product = to_target.x * ego_fwd.x + to_target.y * ego_fwd.y
+            
+            cross_z = ego_fwd.x * to_target.y - ego_fwd.y * to_target.x
+
+            if dot_product > 0 and cross_z < 0:
+                if get_speed(actor) > 10.0:
+                    return True
 
         self._stop_sign_done_id = stop_sign.id
         self._target_stop_sign = None
