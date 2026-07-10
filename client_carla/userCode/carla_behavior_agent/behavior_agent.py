@@ -747,6 +747,7 @@ class BehaviorAgent(BasicAgent):
         if nearest_vehicle is None:
             return False, None, -1
         return True, nearest_vehicle, nearest_distance
+
 #----------------------------------------------------------------------------------------------#
 # BYPASS
 #----------------------------------------------------------------------------------------------#
@@ -1121,7 +1122,7 @@ class BehaviorAgent(BasicAgent):
                 best_walker = walker
 
         if best_walker is None:
-            return False, None, -1
+            return False, None, -1, -1
 
         return True, best_walker, best_ttc, best_distance
 
