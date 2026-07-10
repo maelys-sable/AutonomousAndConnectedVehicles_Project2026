@@ -952,10 +952,38 @@ class BehaviorAgent(BasicAgent):
         return self._incoming_waypoint.is_junction and self._incoming_direction in (RoadOption.LEFT, RoadOption.RIGHT)
 
     def _cross_traffic_obstacle(self, waypoint):
+        scan_distance = 50.0 
+        vehicle_list = self._build_obstacle_list(waypoint, max_distance=scan_distance)
 
-        vehicle_list = self._build_obstacle_list(waypoint, max_distance=self.JUNCTION_DETECTION_DISTANCE)
-        return self._vehicle_obstacle_detected(
-            vehicle_list, self.JUNCTION_DETECTION_DISTANCE, up_angle_th=180)
+        ego_transform = self._vehicle.get_transform()
+        ego_loc = ego_transform.location
+        ego_fwd = ego_transform.get_forward_vector()
+
+        closest_vehicle = None
+        closest_distance = float('inf')
+
+        for target_vehicle in vehicle_list:
+            if target_vehicle.id == self._vehicle.id:
+                continue
+
+            target_loc = target_vehicle.get_location()
+            distance = ego_loc.distance(target_loc)
+
+            if distance > scan_distance:
+                continue
+
+            to_target = target_loc - ego_loc
+            dot_product = to_target.x * ego_fwd.x + to_target.y * ego_fwd.y
+            
+            if dot_product > 0:
+                if distance < closest_distance:
+                    closest_distance = distance
+                    closest_vehicle = target_vehicle
+
+        if closest_vehicle is not None:
+            return True, closest_vehicle, closest_distance
+
+        return False, None, -1
 
     def _junction_gap_is_safe(self, obstacle_state, obstacle_vehicle, obstacle_distance):
 
