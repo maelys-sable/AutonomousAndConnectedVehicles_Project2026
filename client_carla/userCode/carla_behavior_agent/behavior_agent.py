@@ -8,6 +8,7 @@
 waypoints and avoiding other vehicles. The agent also responds to traffic lights,
 traffic signs, and has different possible configurations. """
 
+import math
 import random
 import numpy as np
 import carla
@@ -16,17 +17,6 @@ from local_planner import RoadOption
 from behavior_types import Cautious, Aggressive, Normal
 
 from misc import get_speed, positive, is_within_distance, compute_distance
-
-
-_TWO_WHEELER_PREFIXES = (
-    'vehicle.bh.crossbike',
-    'vehicle.diamondback.century',
-    'vehicle.gazelle.omafiets',
-    'vehicle.harley-davidson.low_rider',
-    'vehicle.kawasaki.ninja',
-    'vehicle.yamaha.yzf',
-    'vehicle.vespa.zx125',
-)
 
 class BehaviorAgent(BasicAgent):
     """
@@ -40,6 +30,84 @@ class BehaviorAgent(BasicAgent):
     and keeping it in a certain range. Finally, different sets of behaviors
     are encoded in the agent, from cautious to a more aggressive ones.
     """
+
+    STATE_LOG_INTERVAL = 20
+
+    STOP_SIGN_SPEED_EPSILON = 0.5       
+    STOP_LINE_TOLERANCE = 2.0          
+    STOP_CREEP_SPEED_KMH = 8.0      
+    STOP_CREEP_MIN_SPEED_KMH = 3.0
+    STOP_FULL_STOP_TICKS = 40
+    
+    PEDESTRIAN_PREDICTION_TIME = 2.5     
+    PEDESTRIAN_STOP_TTC = 1.0       
+    PEDESTRIAN_SLOWDOWN_TTC = 2.0   
+    PEDESTRIAN_LATERAL_MARGIN = 0.8    
+    PEDESTRIAN_FORWARD_MARGIN = 3.0    
+    PEDESTRIAN_WAIT_TIMEOUT_TICKS = 200   
+    PEDESTRIAN_STATIONARY_SPEED = 0.5     
+    PEDESTRIAN_CREEP_SPEED = 5            
+
+    CONTROL_LOSS_HEADING_THRESHOLD = 25.0  
+    CONTROL_LOSS_RECOVERY_THRESHOLD = 8.0   
+    CONTROL_LOSS_MIN_SPEED_KMH = 5.0        
+    CONTROL_LOSS_STABILIZE_SPEED = 20.0     
+    CONTROL_LOSS_TIMEOUT_TICKS = 400        
+    CONTROL_LOSS_DEBOUNCE_TICKS = 3
+    CONTROL_LOSS_BYPASS_GRACE_TICKS = 15
+
+    CONSTR_DETECTION_DISTANCE = 80
+    CONSTR_CLUSTER_GAP = 12.0        
+    CONSTR_CLEAR_MARGIN = 2.0        
+    CONSTR_EXIT_MARGIN = 4.0         
+    CONSTR_PASS_SPEED_KMH = 25.0  
+    CONSTR_GAP_SAFETY_BUFFER = 2.0  
+    CONSTR_MAX_OFFSET = 3.5          
+    CONSTR_SAFETY_STOP_LONG = 6.0 
+
+    BYPASS_DETECTION_DISTANCE = 80
+    BYPASS_MIN_GAP_TIME = 4.0
+    BYPASS_LANE_OVERLAP_MARGIN = 0.3
+    BYPASS_LATERAL_CLEARANCE = 0.5
+    BYPASS_MAX_OFFSET = 2.5
+    BYPASS_CLEAR_LONG_MARGIN = 5.0
+    BYPASS_OVERTAKE_SPEED_FACTOR = 0.8 
+    BYPASS_TIMEOUT_TICKS = 800
+
+    OBSTACLE_MAX_DISTANCE = 45
+    FORWARD_ANGLE_STRAIGHT = 30
+    FORWARD_ANGLE_TURN = 60
+
+    DETECTION_SPEED_MARGIN_SECONDS = 2.5 
+    BRAKING_SPEED_MARGIN_SECONDS = 0.8
+
+    CYCLIST_TYPE_KEYWORDS = (
+        'vehicle.bh.crossbike',
+        'vehicle.diamondback.century',
+        'vehicle.gazelle.omafiets',
+    )
+    CYCLIST_CLEARANCE_OFFSET = 0.5 
+
+    JUNCTION_DETECTION_DISTANCE = 30
+    JUNCTION_MIN_GAP_TIME = 3.0
+    JUNCTION_TIMEOUT_TICKS = 300
+    JUNCTION_STALL_EXCLUSION_DISTANCE = 25.0  
+
+    STALL_SPEED_THRESHOLD = 1.0    
+    STALL_TIMEOUT_TICKS = 150      
+    EGO_BLOCKED_SPEED_THRESHOLD = 2.0    
+    EGO_BLOCKED_CONFIRM_TICKS = 100 
+    STALL_MIN_EGO_MOVED_SPEED_KMH = 10.0   
+    STALL_STARTUP_HARD_BLOCK_TICKS = 400   
+    STALL_STARTUP_GRACE_TICKS = 200   
+    STALL_VEHICLE_MOVED_SPEED_KMH = 5.0
+
+    WET_HEADING_MARGIN = 0.7
+    WET_SPEED_MARGIN = 0.7
+
+#----------------------------------------------------------------------------------------------#
+#   INIT
+#----------------------------------------------------------------------------------------------#
 
     def __init__(self, vehicle, behavior='normal', opt_dict={}, map_inst=None, grp_inst=None):
         """
@@ -61,7 +129,6 @@ class BehaviorAgent(BasicAgent):
         self._min_speed = 5
         self._behavior = None
         self._sampling_resolution = 4.5
-        self._overtake_state = 'IDLE'
 
         # Parameters for agent behavior
         if behavior == 'cautious':
@@ -73,14 +140,205 @@ class BehaviorAgent(BasicAgent):
         elif behavior == 'aggressive':
             self._behavior = Aggressive()
 
+        self._bypassing = False
+        self._bypassed_vehicle = None
+
+        # Cycle : 'idle' -> 'waiting_gap' -> 'overtaking' -> 'returning' -> 'idle'
+        self._bypass_state = 'idle'
+        self._bypass_origin_waypoint = None
+        self._bypass_start_tick = None
+        self._last_bypass_transition_tick = None  
+        self._bypass_target_actor = None       
+        self._bypass_target_resumed_tick_counter = 0  
+        self._bypass_best_offset = None   
+        self._bypass_best_offset_tick = None
+
+        self._bypass_use_offset = False
+        self._bypass_offset = 0.0
+
+        self._constr_state = 'idle'
+        self._constr_zone_actors = []
+        self._constr_offset = 0.0
+        self._constr_start_tick = None
+
+        self._actors = None
+
+        self._tick_count = 0
+        self._scenario_result = None
+
+        # Cycle : 'idle' -> 'waiting_clear' -> 'crossing' -> 'idle'
+        self._junction_state = 'idle'
+        self._junction_start_tick = None
+
+        # Stop-sign state 
+        self._target_stop_sign = None
+        self._stop_sign_done_id = None
+        self._stop_map = {}
+        self._stop_sign_ticks_frozen = 0
+
+        # Stalled-vehicle tracking
+        self._stalled_vehicle_id = None
+        self._stalled_tick_counter = 0
+        self._ego_blocked_tick_counter = 0
+        self._ego_has_moved_normally = False  
+        self._vehicles_seen_moving = set()     
+
+        self._bypass_giveup_id = None
+        self._bypass_giveup_tick = None
+        self._last_bypass_failed_id = None
+        self._bypass_retry_count = 0
+
+        # Pedestrian wait tracking
+        self._pedestrian_wait_id = None
+        self._pedestrian_wait_tick_counter = 0
+
+        # Cycle : 'idle' -> 'stabilizing' -> 'idle'
+        self._control_loss_state = 'idle'
+        self._control_loss_start_tick = None
+        self._control_loss_pending_ticks = 0
+
+#----------------------------------------------------------------------------------------------#
+#   LOGS
+#----------------------------------------------------------------------------------------------#
+
+    def _refresh_actor_snapshot(self):
+        """
+        Retrieves all actors in the scene just once per tick.
+        """
+        self._actors = self._world.get_actors()
+
+    def _track_moving_vehicles(self):
+
+        if self._actors is None:
+            return
+        ego_location = self._vehicle.get_location()
+        for vehicle in self._actors.filter("*vehicle*"):
+            if vehicle.id == self._vehicle.id:
+                continue
+            if vehicle.get_location().distance(ego_location) > self.BYPASS_DETECTION_DISTANCE:
+                continue
+            if get_speed(vehicle) > self.STALL_VEHICLE_MOVED_SPEED_KMH:
+                self._vehicles_seen_moving.add(vehicle.id)
+
+    def _log_stop_sign_transition(self, event, stop_sign=None):
+
+        sid = f" id={stop_sign.id}" if stop_sign is not None else ""
+        messages = {
+            'creeping': f"[STOP] Stop sign ahead{sid} -> creeping up to the line",
+            'stopping': f"[STOP] At the stop line{sid} -> braking to a full stop",
+            'cleared':  f"[STOP] Full stop registered{sid} -> proceeding",
+        }
+        msg = messages.get(event)
+        if msg is None:
+            return
+        if event in ('creeping', 'stopping') and (self._tick_count % self.STATE_LOG_INTERVAL) != 0:
+            return
+        print(msg)
+
+    def _log_vehicle_state(self, waypoint):
+
+        if self._tick_count % self.STATE_LOG_INTERVAL != 0:
+            return
+        loc = waypoint.transform.location
+        print(f"[STATE] tick={self._tick_count} pos=({loc.x:.1f}, {loc.y:.1f}, {loc.z:.1f}) "
+              f"speed={self._speed:.1f} km/h")
+
+    def _log_bypass_transition(self, event, waypoint=None, obstacle=None):
+
+        loc = waypoint.transform.location if waypoint is not None else None
+        pos = f" pos=({loc.x:.1f}, {loc.y:.1f})" if loc is not None else ""
+        obstacle_info = f" obstacle={obstacle.type_id}(id={obstacle.id})" if obstacle is not None else ""
+        messages = {
+            'detected': f"[BYPASS] Obstacle detected{pos}{obstacle_info} -> searching for a gap",
+            'gap_found': f"[BYPASS] Gap found{pos}{obstacle_info} -> start of manoeuvre",
+            'success': f"[BYPASS] TEST SUCCESSFUL: obstacle bypassed, back on track{pos}",
+            'timeout': f"[BYPASS] TEST FAILED: manoeuvre timed out{pos}"
+                       f"(stuck in '{self._bypass_state}')",
+            'no_lane': f"[BYPASS] TEST FAILED: no usable opposite lane{pos} -> abandoning bypass",
+            'resumed_normal': f"[BYPASS] Target resumed normal driving{pos}{obstacle_info} "
+                               f"-> was never really stalled, aborting manoeuvre and reverting "
+                               f"to car-following",
+            'cyclist_gone': f"[BYPASS] Tracked cyclist no longer detected{pos}{obstacle_info} "
+                             f"-> aborting manoeuvre and reverting to normal behaviour",
+            'no_progress': f"[BYPASS] TEST FAILED: overtaking made no progress{pos}{obstacle_info} "
+                            f"-> obstacle never passed (deadlock/too slow), giving up and "
+                            f"reverting to car-following",
+        }
+        print(messages[event])
+        if event == 'success':
+            self._scenario_result = True
+        elif event in ('timeout', 'no_lane', 'no_progress'):
+            self._scenario_result = False
+        # 'resumed_normal' and 'cyclist_gone' are correct self-diagnoses, not scenario
+        # failures - they deliberately leave self._scenario_result untouched.
+
+    def _log_construction_transition(self, event, waypoint=None):
+
+        loc = waypoint.transform.location if waypoint is not None else None
+        pos = f" pos=({loc.x:.1f}, {loc.y:.1f})" if loc is not None else ""
+        n = len(self._constr_zone_actors)
+        messages = {
+            'gap_found': f"[CONSTR] Gap found{pos} -> entering construction zone "
+                         f"({n} props, offset={self._constr_offset:.2f}m) start of manoeuvre",
+            'success': f"[CONSTR] TEST SUCCESSFUL: construction zone cleared, back on track{pos}",
+            'timeout': f"[CONSTR] TEST FAILED: manoeuvre timed out{pos} "
+                       f"(stuck in '{self._constr_state}')",
+        }
+        print(messages[event])
+        if event == 'success':
+            self._scenario_result = True
+        elif event == 'timeout':
+            self._scenario_result = False
+
+    def _log_junction_transition(self, event, waypoint=None):
+
+        loc = waypoint.transform.location if waypoint is not None else None
+        pos = f" pos=({loc.x:.1f}, {loc.y:.1f})" if loc is not None else ""
+        messages = {
+            'waiting': f"[JUNCTION] Blocked or busy junction ahead{pos} -> waiting for a gap",
+            'clear': f"[JUNCTION] Junction clear{pos} -> proceeding with the turn",
+            'timeout': f"[JUNCTION] TEST FAILED: waited too long at the junction{pos} "
+                       f"(stuck in '{self._junction_state}')",
+        }
+        print(messages[event])
+        if event == 'timeout':
+            self._scenario_result = False
+
+    def _log_pedestrian_wait_timeout(self, waypoint=None):
+
+        loc = waypoint.transform.location if waypoint is not None else None
+        pos = f" pos=({loc.x:.1f}, {loc.y:.1f})" if loc is not None else ""
+        print(f"[PEDESTRIAN] Waited too long for a stationary pedestrian{pos} -> creeping past cautiously")
+
+    def _log_control_loss_transition(self, event, waypoint=None):
+
+        loc = waypoint.transform.location if waypoint is not None else None
+        pos = f" pos=({loc.x:.1f}, {loc.y:.1f})" if loc is not None else ""
+        messages = {
+            'detected': f"[CONTROL_LOSS] Uncommanded heading deviation{pos} -> stabilizing (throttle only)",
+            'recovered': f"[CONTROL_LOSS] TEST SUCCESSFUL: heading back under control{pos}",
+            'timeout': f"[CONTROL_LOSS] TEST FAILED: stabilization did not clear in time{pos}",
+        }
+        print(messages[event])
+        if event == 'recovered':
+            self._scenario_result = True
+        elif event == 'timeout':
+            self._scenario_result = False
+
+    def _bypass_timed_out(self):
+
+        return (self._tick_count - self._bypass_start_tick) > self.BYPASS_TIMEOUT_TICKS
+
     def _update_information(self):
-        """
-        This method updates the information regarding the ego
-        vehicle based on the surrounding world.
-        """
+
+        self._refresh_actor_snapshot()
+        self._track_moving_vehicles()
         self._speed = get_speed(self._vehicle)
         self._speed_limit = self._vehicle.get_speed_limit()
         self._local_planner.set_speed(self._speed_limit)
+        # Default to no lateral offset each tick; the cyclist-clearance logic
+        # re-applies one only when a cyclist is detected ahead.
+        self._local_planner.set_offset(0)
         self._direction = self._local_planner.target_road_option
         if self._direction is None:
             self._direction = RoadOption.LANEFOLLOW
@@ -92,15 +350,772 @@ class BehaviorAgent(BasicAgent):
         if self._incoming_direction is None:
             self._incoming_direction = RoadOption.LANEFOLLOW
 
+#----------------------------------------------------------------------------------------------#
+#   TRAFFIC SIGNS
+#----------------------------------------------------------------------------------------------#
+
     def traffic_light_manager(self):
         """
         This method is in charge of behaviors for red lights.
         """
-        actor_list = self._world.get_actors()
+        actor_list = self._actors
         lights_list = actor_list.filter("*traffic_light*")
         affected, _ = self._affected_by_traffic_light(lights_list)
 
         return affected
+
+#----------------------------------------------------------------------------------------------#
+#   STOP SIGNS
+#----------------------------------------------------------------------------------------------#
+
+    def _distance_to_stop_line(self, stop_sign, ego_loc):
+
+        trigger_wp = self._stop_map.get(stop_sign.id)
+        if trigger_wp is None:
+            return None
+        return trigger_wp.transform.location.distance(ego_loc)
+
+    def _stop_creep_speed(self, distance_to_line):
+
+        span = max(self.STOP_SIGN_BASE_THRESHOLD, 1.0)
+        ratio = max(0.0, min(1.0, (distance_to_line - self.STOP_LINE_TOLERANCE) / span))
+        speed = self.STOP_CREEP_MIN_SPEED_KMH + ratio * (
+            self.STOP_CREEP_SPEED_KMH - self.STOP_CREEP_MIN_SPEED_KMH)
+        return speed
+
+    def stop_sign_manager(self, debug=False):
+        """
+        Stop management with creep-to-line
+        """
+        affected, stop_sign = self._affected_by_stop_sign()
+
+        if not affected:
+            self._target_stop_sign = None
+            self._stop_sign_done_id = None
+            self._stop_sign_ticks_frozen = 0
+            return None
+
+        if stop_sign.id == self._stop_sign_done_id:
+            return None
+
+        self._target_stop_sign = stop_sign.id
+        ego_speed = get_speed(self._vehicle)
+        ego_loc = self._vehicle.get_location()
+        distance_to_line = self._distance_to_stop_line(stop_sign, ego_loc)
+
+        if distance_to_line is not None and distance_to_line > self.STOP_LINE_TOLERANCE:
+            self._log_stop_sign_transition('creeping', stop_sign)
+            self._stop_sign_ticks_frozen = 0
+            creep_speed = self._stop_creep_speed(distance_to_line)
+            self._local_planner.set_speed(self._clamp_to_speed_limit(creep_speed))
+            return self._local_planner.run_step(debug=debug)
+
+        if ego_speed >= self.STOP_SIGN_SPEED_EPSILON:
+            self._log_stop_sign_transition('stopping', stop_sign)
+            self._stop_sign_ticks_frozen = 0
+            return self._hold_position(debug=debug)
+
+        self._stop_sign_ticks_frozen += 1
+
+        if self._stop_sign_ticks_frozen < self.STOP_FULL_STOP_TICKS:
+            return self._hold_position(debug=debug)
+
+        ego_transform = self._vehicle.get_transform()
+        ego_loc = ego_transform.location
+        ego_fwd = ego_transform.get_forward_vector()
+
+        scan_distance = 45.0
+        obstacle_list = self._build_obstacle_list(self._map.get_waypoint(ego_loc), max_distance=scan_distance)
+
+        for actor in obstacle_list:
+            if actor.id == self._vehicle.id or "vehicle" not in actor.type_id:
+                continue
+
+            target_loc = actor.get_location()
+            distance = ego_loc.distance(target_loc)
+
+            to_target = target_loc - ego_loc
+
+            dot_product = to_target.x * ego_fwd.x + to_target.y * ego_fwd.y
+
+            cross_z = ego_fwd.x * to_target.y - ego_fwd.y * to_target.x
+
+            if dot_product > 0 and cross_z < 0:
+                if get_speed(actor) > 10.0:
+                    return self._hold_position(debug=debug)
+
+        self._stop_sign_done_id = stop_sign.id
+        self._target_stop_sign = None
+        self._stop_sign_ticks_frozen = 0
+        self._log_stop_sign_transition('cleared', stop_sign)
+        return None
+
+#----------------------------------------------------------------------------------------------#
+# PEDESTRIAN AVOID
+#----------------------------------------------------------------------------------------------#
+
+    def _update_pedestrian_wait_tracking(self, walker):
+
+        if walker is None:
+            self._pedestrian_wait_id = None
+            self._pedestrian_wait_tick_counter = 0
+            return
+
+        if walker.id != self._pedestrian_wait_id:
+            self._pedestrian_wait_id = walker.id
+            self._pedestrian_wait_tick_counter = 0
+
+        self._pedestrian_wait_tick_counter += 1
+
+    def _pedestrian_wait_timed_out(self):
+
+        return self._pedestrian_wait_tick_counter > self.PEDESTRIAN_WAIT_TIMEOUT_TICKS
+
+    def _pedestrian_is_stationary(self, walker):
+
+        return get_speed(walker) < self.PEDESTRIAN_STATIONARY_SPEED
+    
+    def _time_until_lane_crossing(self, walker, waypoint):
+
+        longitudinal, lateral = self._road_projection(walker, waypoint)
+        _, lateral_speed = self._road_velocity_projection(walker, waypoint)
+        half_lane = (waypoint.lane_width / 2 + self.PEDESTRIAN_LATERAL_MARGIN)
+
+        if abs(lateral) <= half_lane:
+            return 0.0
+
+        if lateral * lateral_speed > 0:
+            return None
+
+        if abs(lateral_speed) < 0.05:
+            return None
+
+        distance_to_lane = abs(lateral) - half_lane
+
+        return distance_to_lane / abs(lateral_speed)
+
+    def pedestrian_avoid_manager(self, waypoint):
+        """
+        Detects pedestrians that are actually on (or about to enter) the ego lane.
+        """
+
+        ego_loc = self._vehicle.get_location()
+
+        best_walker = None
+        best_distance = float("inf")
+        best_ttc = float("inf")
+
+        for walker in self._actors.filter("*walker.pedestrian*"):
+            distance = compute_distance(ego_loc, walker.get_location())
+            if distance > self._collision_detection_range():
+                continue
+
+            longitudinal, lateral = self._road_projection(walker, waypoint)
+
+            # Ignore pedestrians behind us
+            if longitudinal < -2:
+                continue
+
+            ttc = self._time_until_lane_crossing(walker, waypoint)
+
+            if ttc is None:
+                continue
+
+            if ttc > self.PEDESTRIAN_PREDICTION_TIME:
+                continue
+            
+            if ttc < best_ttc :
+                best_distance = distance
+                best_ttc = ttc
+                best_walker = walker
+
+        if best_walker is None:
+            return False, None, -1, -1
+
+        return True, best_walker, best_ttc, best_distance
+
+#----------------------------------------------------------------------------------------------#
+# CONTROL LOSS
+#----------------------------------------------------------------------------------------------#
+
+    def _road_heading(self, waypoint):
+
+        return waypoint.transform.rotation.yaw
+
+    def _velocity_heading(self):
+
+        vel = self._vehicle.get_velocity()
+        return math.degrees(math.atan2(vel.y, vel.x))
+
+    def _heading_deviation(self, waypoint):
+
+        diff = (self._velocity_heading() - self._road_heading(waypoint)) % 360.0
+        if diff > 180.0:
+            diff = 360.0 - diff
+        return diff
+
+    def _wet_severity(self):
+
+        try:
+            weather = self._world.get_weather()
+        except AttributeError:
+            return 0.0
+        wetness = getattr(weather, 'wetness', 0.0)
+        precipitation = getattr(weather, 'precipitation', 0.0)
+        return max(wetness, precipitation) / 100.0
+
+    def _control_loss_heading_threshold(self):
+
+        severity = self._wet_severity()
+        margin = 1.0 - (1.0 - self.WET_HEADING_MARGIN) * severity
+        return self.CONTROL_LOSS_HEADING_THRESHOLD * margin
+
+    def _control_loss_stabilize_speed(self):
+
+        severity = self._wet_severity()
+        margin = 1.0 - (1.0 - self.WET_SPEED_MARGIN) * severity
+        return self.CONTROL_LOSS_STABILIZE_SPEED * margin
+
+    def _in_bypass_maneuver_grace_period(self):
+
+        if not self._bypassing or self._bypass_start_tick is None:
+            return False
+        return (self._tick_count - self._bypass_start_tick) <= self.CONTROL_LOSS_BYPASS_GRACE_TICKS
+
+    def _control_loss_detected(self, waypoint):
+
+        if self._direction in (RoadOption.CHANGELANELEFT, RoadOption.CHANGELANERIGHT):
+            return False
+        if self._in_bypass_maneuver_grace_period():
+            return False
+        if self._speed < self.CONTROL_LOSS_MIN_SPEED_KMH:
+            return False
+        return self._heading_deviation(waypoint) > self._control_loss_heading_threshold()
+
+    def _control_loss_recovered(self, waypoint):
+
+        return self._heading_deviation(waypoint) < self.CONTROL_LOSS_RECOVERY_THRESHOLD
+
+    def _control_loss_timed_out(self):
+
+        return (self._tick_count - self._control_loss_start_tick) > self.CONTROL_LOSS_TIMEOUT_TICKS
+
+    def _reset_control_loss_state(self):
+        """Resets the status of the control-loss stabilization module."""
+        self._control_loss_state = 'idle'
+        self._control_loss_start_tick = None
+        self._control_loss_pending_ticks = 0
+
+    def control_loss_manager(self, waypoint):
+
+        if self._control_loss_state == 'idle':
+            if self._control_loss_detected(waypoint):
+                self._control_loss_pending_ticks += 1
+                if self._control_loss_pending_ticks >= self.CONTROL_LOSS_DEBOUNCE_TICKS:
+                    self._control_loss_state = 'stabilizing'
+                    self._control_loss_start_tick = self._tick_count
+                    self._control_loss_pending_ticks = 0
+                    self._log_control_loss_transition('detected', waypoint)
+            else:
+                self._control_loss_pending_ticks = 0
+            return self._control_loss_state != 'idle'
+
+        if self._control_loss_timed_out():
+            self._log_control_loss_transition('timeout', waypoint)
+            self._reset_control_loss_state()
+            return False
+
+        if self._control_loss_recovered(waypoint):
+            self._log_control_loss_transition('recovered', waypoint)
+            self._reset_control_loss_state()
+            return False
+
+        return True
+
+#----------------------------------------------------------------------------------------------#
+# CONSTRUCTION ZONE
+#----------------------------------------------------------------------------------------------#
+
+    def _construction_props_ahead(self, waypoint):
+        props = []
+
+        for actor in self._build_obstacle_list(waypoint, max_distance=self.CONSTR_DETECTION_DISTANCE):
+            if "static.prop" not in actor.type_id:
+                continue
+            longitudinal, _ = self._road_projection(actor, waypoint)
+            if longitudinal <= 0:
+                continue
+            if not self._is_obstacle_in_lane(actor, waypoint):
+                continue
+            props.append((actor, longitudinal))
+
+        props.sort(key=lambda p: p[1])
+        return props
+
+    def _build_construction_zone(self, waypoint):
+
+        props = self._construction_props_ahead(waypoint)
+
+        if not props:
+            return None
+        
+        cluster = [props[0]]
+        for actor, longitudinal in props[1:]:
+            if longitudinal - cluster[-1][1] > self.CONSTR_CLUSTER_GAP:
+                break
+            cluster.append((actor, longitudinal))
+
+        return {
+            'actors': [a for a, _ in cluster],
+            'start': cluster[0][1],
+            'end': cluster[-1][1],
+        }
+
+    def _prop_lane_lateral(self, prop):
+
+        prop_wp = self._map.get_waypoint(prop.get_location())
+        _, lateral = self._road_projection(prop, prop_wp)
+        half_width = max(prop.bounding_box.extent.x, prop.bounding_box.extent.y)
+
+        return lateral, half_width, prop_wp.lane_width
+
+    def _ego_half_width(self):
+
+        return max(self._vehicle.bounding_box.extent.x, self._vehicle.bounding_box.extent.y)
+
+    def _zone_offset(self, zone):
+
+        ego_half = self._ego_half_width()
+        needed = 0.0
+
+        for prop in zone['actors']:
+            lateral, half_width, _ = self._prop_lane_lateral(prop)
+            limit = lateral - half_width - ego_half - self.CONSTR_CLEAR_MARGIN
+            needed = min(needed, limit)
+
+        return max(needed, -self.CONSTR_MAX_OFFSET)
+
+    def _zone_pass_duration(self, zone):
+
+        ego_length = 2 * self._vehicle.bounding_box.extent.x
+        length = (zone['end'] - zone['start']) + ego_length + 2 * self.CONSTR_EXIT_MARGIN
+        speed_ms = self.CONSTR_PASS_SPEED_KMH / 3.6
+        return length / max(speed_ms, 0.1)
+
+    def _zone_gap_clear(self, waypoint, zone):
+
+        state, oncoming, distance = self._oncoming_lane_obstacle(waypoint)
+
+        if not state:
+            return True
+
+        required = self._zone_pass_duration(zone) + self.CONSTR_GAP_SAFETY_BUFFER
+        speed_ms = get_speed(oncoming) / 3.6
+
+        if speed_ms <= 0:
+            return True
+
+        safe = (distance / speed_ms) >= required
+        print(
+            f"[CONSTR] Oncoming check: {oncoming.type_id}(id={oncoming.id}) "
+            f"dist={distance:.1f}m speed={get_speed(oncoming):.1f}km/h "
+            f"required_gap={required:.1f}s -> {'CLEAR, entering' if safe else 'BLOCKED, yielding'}"
+        )
+        return safe
+
+    def _zone_passed(self, waypoint):
+
+        rear = self._vehicle.bounding_box.extent.x + self.CONSTR_EXIT_MARGIN
+
+        for prop in self._constr_zone_actors:
+            longitudinal, _ = self._road_projection(prop, waypoint)
+
+            if longitudinal > -rear:
+                return False
+
+        return True
+
+    def _zone_safety_stop_needed(self, waypoint):
+
+        ego_half = self._ego_half_width()
+        ego_left = self._constr_offset - ego_half
+        ego_right = self._constr_offset + ego_half
+
+        for prop in self._constr_zone_actors:
+            longitudinal, _ = self._road_projection(prop, waypoint)
+            if longitudinal < -ego_half or longitudinal > self.CONSTR_SAFETY_STOP_LONG:
+                continue
+            lateral, half_width, _ = self._prop_lane_lateral(prop)
+            prop_left = lateral - half_width
+            prop_right = lateral + half_width
+            overlap = not (ego_right < prop_left or ego_left > prop_right)
+
+            if overlap:
+                return True
+
+        return False
+
+    def _reset_construction_state(self):
+
+        self._constr_state = 'idle'
+        self._constr_zone_actors = []
+        self._constr_offset = 0.0
+        self._constr_start_tick = None
+
+    def construction_zone_manager(self, waypoint, debug=False):
+
+        if self._constr_state == 'idle':
+            zone = self._build_construction_zone(waypoint)
+            if zone is None:
+                return None
+
+            left_lane = waypoint.get_left_lane()
+
+            if left_lane is None or left_lane.lane_type != carla.LaneType.Driving:
+                return None
+            
+            self._local_planner.set_offset(0)
+            if not self._zone_gap_clear(waypoint, zone):
+                return self._hold_position(debug=debug)
+
+            self._constr_zone_actors = zone['actors']
+            self._constr_offset = self._zone_offset(zone)
+            self._constr_state = 'passing'
+            self._constr_start_tick = self._tick_count
+            self._log_construction_transition('gap_found', waypoint)
+
+        # passing
+        if self._zone_passed(waypoint):
+            self._local_planner.set_offset(0)
+            self._log_construction_transition('success', waypoint)
+            self._reset_construction_state()
+            return None
+
+        if (self._tick_count - self._constr_start_tick) > self.BYPASS_TIMEOUT_TICKS:
+            self._local_planner.set_offset(0)
+            self._log_construction_transition('timeout', waypoint)
+            self._reset_construction_state()
+            return None
+        
+        self._local_planner.set_offset(self._constr_offset)
+
+        if self._zone_safety_stop_needed(waypoint):
+            return self.emergency_stop()
+
+        target_speed = min(self.CONSTR_PASS_SPEED_KMH, self._behavior.max_speed)
+        self._local_planner.set_speed(self._clamp_to_speed_limit(target_speed))
+        return self._local_planner.run_step(debug=debug)
+
+#----------------------------------------------------------------------------------------------#
+# BYPASS
+#----------------------------------------------------------------------------------------------#
+
+    def _gap_is_safe(self, oncoming_distance, oncoming_speed, min_gap_time=None, ego_speed=0.0):
+        if min_gap_time is None:
+            min_gap_time = self.BYPASS_MIN_GAP_TIME
+
+        if oncoming_distance is None or oncoming_distance < 0:
+            return True
+
+        closing_speed_ms = (oncoming_speed + ego_speed) / 3.6
+        if closing_speed_ms <= 0:
+            return True
+
+        time_to_arrival = oncoming_distance / closing_speed_ms
+        return time_to_arrival >= min_gap_time
+
+    def _oncoming_gap_clear(self, waypoint):
+
+        oncoming_state, oncoming_vehicle, oncoming_distance = self._oncoming_lane_obstacle(waypoint)
+        if not oncoming_state:
+            return True
+        
+        oncoming_speed = get_speed(oncoming_vehicle)
+        safe = self._gap_is_safe(oncoming_distance, oncoming_speed,
+                                 ego_speed=self._speed)
+        print(
+            f"[BYPASS] Oncoming check: {oncoming_vehicle.type_id}(id={oncoming_vehicle.id}) "
+            f"dist={oncoming_distance:.1f}m speed={oncoming_speed:.1f}km/h "
+            f"-> {'CLEAR, overtaking' if safe else 'BLOCKED, yielding'}"
+        )
+        return safe  
+      
+    def _obstacle_cleared(self):
+
+        if self._bypassed_vehicle is None:
+            return False
+
+        ego_loc = self._vehicle.get_location()
+        obs_loc = self._bypassed_vehicle.get_location()
+
+        ego_wp = self._map.get_waypoint(ego_loc)
+        obs_wp = self._map.get_waypoint(obs_loc)
+
+        if ego_wp.road_id != obs_wp.road_id:
+            return False
+
+        if ego_wp.lane_id == obs_wp.lane_id:
+            return False
+
+        return ego_loc.distance(obs_loc) > 15
+
+    def _compute_bypass_offset(self, obstacle, waypoint):
+
+        _, lateral = self._road_projection(obstacle, waypoint)
+        obstacle_half_width = max(obstacle.bounding_box.extent.x,
+                                  obstacle.bounding_box.extent.y)
+        ego_half_width = self._vehicle.bounding_box.extent.y
+
+        offset = lateral - obstacle_half_width - self.BYPASS_LATERAL_CLEARANCE - ego_half_width
+
+        if offset >= 0:
+            return 0.0
+        if abs(offset) > self.BYPASS_MAX_OFFSET:
+            return None
+        return offset
+
+    def _bypass_obstacle_passed(self, waypoint):
+        """True once the bypassed obstacle is behind the ego by a margin."""
+        if self._bypassed_vehicle is None:
+            return False
+        longitudinal, _ = self._road_projection(self._bypassed_vehicle, waypoint)
+        return longitudinal < -self.BYPASS_CLEAR_LONG_MARGIN
+
+    def _reset_bypass_state(self):
+
+        self._bypassing = False
+        self._bypassed_vehicle = None
+        self._bypass_state = 'idle'
+        self._bypass_origin_waypoint = None
+        self._bypass_start_tick = None
+        self._last_bypass_transition_tick = None
+        self._bypass_target_actor = None
+        self._bypass_target_resumed_tick_counter = 0
+        self._bypass_best_offset = None
+        self._bypass_best_offset_tick = None
+        self._bypass_use_offset = False
+        self._bypass_offset = 0.0
+        self._stalled_vehicle_id = None
+        self._stalled_tick_counter = 0
+        self._ego_blocked_tick_counter = 0
+
+    def _try_lane_change(self, direction):
+
+        speed = self._vehicle.get_velocity().length()
+        path = self._generate_lane_change_path(
+            self._map.get_waypoint(self._vehicle.get_location()),
+            direction,
+            0,            # same-lane distance
+            0,            # other-lane distance
+            2 * speed,    # lane-change distance
+            False,        # check
+            1,            # number of lane changes
+            self._sampling_resolution)
+        if not path:
+            return False
+        self.set_global_plan(path)
+        return True
+
+    def bypass_obstacle_manager(self, waypoint):
+
+        if not self._bypassing:
+            obstacle_state, obstacle, _ = self._blocking_obstacle_ahead(waypoint)
+            if not obstacle_state:
+                return False
+
+            left_lane = waypoint.get_left_lane()
+            if left_lane is None or left_lane.lane_type != carla.LaneType.Driving:
+                return False
+
+            if not self._oncoming_gap_clear(waypoint):
+                return True
+
+            offset = self._compute_bypass_offset(obstacle, waypoint)
+            if offset is None:
+                if not self._try_lane_change("left"):
+                    return True
+                self._bypass_use_offset = False
+            else:
+                self._bypass_use_offset = True
+                self._bypass_offset = offset
+
+            self._log_bypass_transition('gap_found', waypoint, obstacle)
+            self._bypassing = True
+            self._bypassed_vehicle = obstacle
+            self._bypass_start_tick = self._tick_count
+            return True
+
+        # Currently overtaking.
+        if self._bypass_use_offset:
+            if self._bypass_obstacle_passed(waypoint):
+                self._log_bypass_transition('success', waypoint)
+                self._reset_bypass_state()
+                return False
+            if self._bypass_timed_out():
+                self._log_bypass_transition('timeout', waypoint)
+                self._reset_bypass_state()
+                return False
+            return True
+
+        if self._obstacle_cleared():
+            if self._try_lane_change("right"):
+                self._log_bypass_transition('success', waypoint)
+                self._reset_bypass_state()
+                return False
+            return True
+
+        if self._bypass_timed_out():
+            self._try_lane_change("right")   # best effort, ignore failure
+            self._log_bypass_transition('timeout', waypoint)
+            self._reset_bypass_state()
+            return False
+
+        return True
+
+#----------------------------------------------------------------------------------------------#
+# CAR FOLLOWING
+#----------------------------------------------------------------------------------------------#
+
+    def car_following_manager(self, vehicle, distance, debug=False):
+        """
+        Module in charge of car-following behaviors when there's
+        someone in front of us.
+
+            :param vehicle: car to follow
+            :param distance: distance from vehicle
+            :param debug: boolean for debugging
+            :return control: carla.VehicleControl
+        """
+
+        vehicle_speed = get_speed(vehicle)
+        delta_v = max(1, (self._speed - vehicle_speed) / 3.6)
+        ttc = distance / delta_v if delta_v != 0 else distance / np.nextafter(0., 1.)
+
+        # Under safety time distance, slow down.
+        if self._behavior.safety_time > ttc > 0.0:
+            target_speed = min([
+                positive(vehicle_speed - self._behavior.speed_decrease),
+                self._behavior.max_speed,
+                self._speed_limit - self._behavior.speed_lim_dist])
+            self._local_planner.set_speed(self._clamp_to_speed_limit(target_speed))
+            control = self._local_planner.run_step(debug=debug)
+
+        # Actual safety distance area, try to follow the speed of the vehicle in front.
+        elif 2 * self._behavior.safety_time > ttc >= self._behavior.safety_time:
+            target_speed = min([
+                max(self._min_speed, vehicle_speed),
+                self._behavior.max_speed,
+                self._speed_limit - self._behavior.speed_lim_dist])
+            self._local_planner.set_speed(self._clamp_to_speed_limit(target_speed))
+            control = self._local_planner.run_step(debug=debug)
+
+        # Normal behavior.
+        else:
+            target_speed = min([
+                self._behavior.max_speed,
+                self._speed_limit - self._behavior.speed_lim_dist])
+            self._local_planner.set_speed(self._clamp_to_speed_limit(target_speed))
+            control = self._local_planner.run_step(debug=debug)
+
+        return control
+
+#----------------------------------------------------------------------------------------------#
+#   JUNCTION
+#----------------------------------------------------------------------------------------------#
+
+    def _junction_ahead(self):
+
+        return self._incoming_waypoint.is_junction and self._incoming_direction in (RoadOption.LEFT, RoadOption.RIGHT)
+
+    def _cross_traffic_obstacle(self, waypoint):
+        scan_distance = 50.0 
+        vehicle_list = self._build_obstacle_list(waypoint, max_distance=scan_distance)
+
+        ego_transform = self._vehicle.get_transform()
+        ego_loc = ego_transform.location
+        ego_fwd = ego_transform.get_forward_vector()
+
+        closest_vehicle = None
+        closest_distance = float('inf')
+
+        for target_vehicle in vehicle_list:
+            if target_vehicle.id == self._vehicle.id:
+                continue
+
+            target_loc = target_vehicle.get_location()
+            distance = ego_loc.distance(target_loc)
+
+            if distance > scan_distance:
+                continue
+
+            to_target = target_loc - ego_loc
+            dot_product = to_target.x * ego_fwd.x + to_target.y * ego_fwd.y
+            
+            if dot_product > 0:
+                if distance < closest_distance:
+                    closest_distance = distance
+                    closest_vehicle = target_vehicle
+
+        if closest_vehicle is not None:
+            return True, closest_vehicle, closest_distance
+
+        return False, None, -1
+
+    def _junction_gap_is_safe(self, obstacle_state, obstacle_vehicle, obstacle_distance):
+
+        if not obstacle_state:
+            return True
+        return self._gap_is_safe(obstacle_distance, get_speed(obstacle_vehicle),
+                                  min_gap_time=self.JUNCTION_MIN_GAP_TIME)
+
+    def _junction_timed_out(self):
+
+        return (self._tick_count - self._junction_start_tick) > self.JUNCTION_TIMEOUT_TICKS
+
+    def _reset_junction_state(self):
+
+        self._junction_state = 'idle'
+        self._junction_start_tick = None
+
+    def junction_manager(self, waypoint):
+        """
+        Generic module for junction crossing. Drives the cycle of
+        detection -> waiting for a clear gap -> crossing
+        """
+        if not self._junction_ahead():
+            if self._junction_state != 'idle':
+                self._reset_junction_state()
+            return False
+
+        if self._junction_state == 'crossing':
+            return False
+
+        if self._junction_state == 'idle':
+            self._junction_state = 'waiting_clear'
+            self._junction_start_tick = self._tick_count
+            self._log_junction_transition('waiting', waypoint)
+
+        if self._junction_timed_out():
+            self._log_junction_transition('timeout', waypoint)
+            self._reset_junction_state()
+            return False
+
+        obstacle_state, obstacle_vehicle, obstacle_distance = self._cross_traffic_obstacle(waypoint)
+        if self._junction_gap_is_safe(obstacle_state, obstacle_vehicle, obstacle_distance):
+            self._log_junction_transition('clear', waypoint)
+            self._junction_state = 'crossing'
+            return False
+
+        return True
+
+    def _hold_position(self, debug=False):
+
+        self._local_planner.set_speed(0)
+        return self._local_planner.run_step(debug=debug)
+
+#----------------------------------------------------------------------------------------------#
+#   COLLISION AND CAR AVOID
+#----------------------------------------------------------------------------------------------#
 
     def _tailgating(self, waypoint, vehicle_list):
         """
@@ -140,6 +1155,87 @@ class BehaviorAgent(BasicAgent):
                     self.set_destination(end_waypoint.transform.location,
                                          left_wpt.transform.location)
 
+    def _build_obstacle_list(self, waypoint, max_distance=None):
+        
+        max_distance = self.OBSTACLE_MAX_DISTANCE if max_distance is None else max_distance
+        actors = self._actors
+        obstacle_list = list(actors.filter("*vehicle*")) + list(actors.filter("*static.prop*"))
+
+        def dist(v): return v.get_location().distance(waypoint.transform.location)
+        return [v for v in obstacle_list if dist(v) < max_distance and v.id != self._vehicle.id]
+
+    def _dynamic_forward_distance(self, base_distance):
+
+        speed_ms = self._speed / 3.6
+        return base_distance + speed_ms * self.DETECTION_SPEED_MARGIN_SECONDS
+
+    def _effective_braking_distance(self):
+
+        speed_ms = self._speed / 3.6
+        return self._behavior.braking_distance + speed_ms * self.BRAKING_SPEED_MARGIN_SECONDS
+
+    def _collision_detection_range(self):
+
+        base = max(self.OBSTACLE_MAX_DISTANCE,
+                   self._behavior.min_proximity_threshold,
+                   self._speed_limit / 3)
+        return self._dynamic_forward_distance(base)
+
+    def _road_projection(self, actor, waypoint):
+
+        yaw = math.radians(waypoint.transform.rotation.yaw)
+        forward = (math.cos(yaw), math.sin(yaw))
+        right = (-math.sin(yaw), math.cos(yaw))
+        loc = actor.get_location()
+        origin = waypoint.transform.location
+        dx, dy = loc.x - origin.x, loc.y - origin.y
+        longitudinal = dx * forward[0] + dy * forward[1]
+        lateral = dx * right[0] + dy * right[1]
+
+        return longitudinal, lateral
+    
+    def _road_velocity_projection(self, actor, waypoint):
+
+        yaw = math.radians(waypoint.transform.rotation.yaw)
+        forward = (math.cos(yaw), math.sin(yaw))
+        right = (-math.sin(yaw), math.cos(yaw))
+        vel = actor.get_velocity()
+        longitudinal = vel.x * forward[0] + vel.y * forward[1]
+        lateral = vel.x * right[0] + vel.y * right[1]
+
+        return longitudinal, lateral
+
+    def _lateral_hazard_ahead(self, waypoint):
+
+        obstacle_list = self._build_obstacle_list(waypoint, max_distance=self._collision_detection_range())
+        detected, vehicle, distance = self._vehicle_obstacle_detected(
+            obstacle_list, max_distance=30
+        )
+        if detected is False:
+            return False, None, -1
+        return True, vehicle, distance
+
+    def _forward_detection_angle(self):
+
+        return (
+            self.FORWARD_ANGLE_TURN
+            if self._incoming_direction in (RoadOption.LEFT, RoadOption.RIGHT)
+            else self.FORWARD_ANGLE_STRAIGHT
+        )
+
+    def _lane_change_obstacle_detected(self, vehicle_list, lane_offset):
+
+        return self._vehicle_obstacle_detected(
+            vehicle_list, max(
+                self._behavior.min_proximity_threshold, self._speed_limit / 2),
+            up_angle_th=180, lane_offset=lane_offset)
+
+    def _forward_obstacle_detected(self, vehicle_list):
+
+        return self._vehicle_obstacle_detected(
+            vehicle_list, self._collision_detection_range(),
+            up_angle_th=self._forward_detection_angle())
+
     def collision_and_car_avoid_manager(self, waypoint):
         """
         This module is in charge of warning in case of a collision
@@ -152,23 +1248,18 @@ class BehaviorAgent(BasicAgent):
             :return distance: distance to nearby vehicle
         """
 
-        vehicle_list = list(self._world.get_actors().filter("*vehicle*")) + \
-               list(self._world.get_actors().filter("*static.prop*"))
-        def dist(v): return v.get_location().distance(waypoint.transform.location)
-        vehicle_list = [v for v in vehicle_list if dist(v) < 45 and v.id != self._vehicle.id]
+        vehicle_list = self._build_obstacle_list(waypoint, max_distance=self._collision_detection_range())
 
         if self._direction == RoadOption.CHANGELANELEFT:
-            vehicle_state, vehicle, distance = self._vehicle_obstacle_detected(
-                vehicle_list, max(
-                    self._behavior.min_proximity_threshold, self._speed_limit / 2), up_angle_th=180, lane_offset=-1)
+            vehicle_state, vehicle, distance = self._lane_change_obstacle_detected(vehicle_list, lane_offset=-1)
         elif self._direction == RoadOption.CHANGELANERIGHT:
-            vehicle_state, vehicle, distance = self._vehicle_obstacle_detected(
-                vehicle_list, max(
-                    self._behavior.min_proximity_threshold, self._speed_limit / 2), up_angle_th=180, lane_offset=1)
+            vehicle_state, vehicle, distance = self._lane_change_obstacle_detected(vehicle_list, lane_offset=1)
         else:
-            vehicle_state, vehicle, distance = self._vehicle_obstacle_detected(
-                vehicle_list, max(
-                    self._behavior.min_proximity_threshold, self._speed_limit / 3), up_angle_th=30)
+            vehicle_state, vehicle, distance = self._forward_obstacle_detected(vehicle_list)
+
+            lateral_state, lateral_actor, lateral_distance = self._lateral_hazard_ahead(waypoint)
+            if lateral_state and (not vehicle_state or lateral_distance < distance):
+                vehicle_state, vehicle, distance = lateral_state, lateral_actor, lateral_distance
 
             # Check for tailgating
             if not vehicle_state and self._direction == RoadOption.LANEFOLLOW \
@@ -178,278 +1269,207 @@ class BehaviorAgent(BasicAgent):
 
         return vehicle_state, vehicle, distance
 
-    def _is_two_wheeler(self, actor):
-        return actor.type_id.startswith(_TWO_WHEELER_PREFIXES)
+#----------------------------------------------------------------------------------------------#
 
-    def pedestrian_avoid_manager(self, waypoint):
-        walker_list = list(self._world.get_actors().filter("*walker.pedestrian*"))
-        bike_list = [v for v in self._world.get_actors().filter("*vehicle*") if self._is_two_wheeler(v)]
-        hazard_list = walker_list + bike_list
-
-        # Log seulement si le nombre de vélos suivis change
-        if len(bike_list) != getattr(self, '_last_bike_count', -1):
-            print(f"[BikeDetect] {len(bike_list)} vélo(s) suivi(s): {[b.type_id for b in bike_list]}")
-            self._last_bike_count = len(bike_list)
-
-        def dist(w): return w.get_location().distance(waypoint.transform.location)
-        hazard_list = [w for w in hazard_list if dist(w) < 20]
-
-        if self._direction == RoadOption.CHANGELANELEFT:
-            state, obj, distance = self._vehicle_obstacle_detected(hazard_list, max(
-                self._behavior.min_proximity_threshold, self._speed_limit / 2), up_angle_th=90, lane_offset=-1)
-        elif self._direction == RoadOption.CHANGELANERIGHT:
-            state, obj, distance = self._vehicle_obstacle_detected(hazard_list, max(
-                self._behavior.min_proximity_threshold, self._speed_limit / 2), up_angle_th=90, lane_offset=1)
-        else:
-            state, obj, distance = self._vehicle_obstacle_detected(hazard_list, max(
-                self._behavior.min_proximity_threshold, self._speed_limit / 3), up_angle_th=90)
-
-        # Log seulement quand le danger apparaît/disparaît, pas à chaque tick
-        was_danger = getattr(self, '_last_danger_state', False)
-        if state != was_danger:
-            if state:
-                print(f"[BikeDetect] DANGER détecté: {obj.type_id} à {distance:.1f}m")
-            else:
-                print(f"[BikeDetect] Danger écarté")
-            self._last_danger_state = state
-
-        return state, obj, distance
-
-    def car_following_manager(self, vehicle, distance, debug=False):
+    def _bbox_adjusted_distance(self, actor, distance):
         """
-        Module in charge of car-following behaviors when there's
-        someone in front of us.
-
-            :param vehicle: car to follow
-            :param distance: distance from vehicle
-            :param debug: boolean for debugging
-            :return control: carla.VehicleControl
+        Converts a center-to-center distance into an edge-to-edge one using
+        both actors' bounding boxes
         """
+        return distance - max(
+            actor.bounding_box.extent.y, actor.bounding_box.extent.x) - max(
+                self._vehicle.bounding_box.extent.y, self._vehicle.bounding_box.extent.x)
 
-        vehicle_speed = get_speed(vehicle)
-        delta_v = max(1, (self._speed - vehicle_speed) / 3.6)
-        ttc = distance / delta_v if delta_v != 0 else distance / np.nextafter(0., 1.)
+    def _react_to_moving_obstacle(self, waypoint, debug=False):
 
-        # Under safety time distance, slow down.
-        if self._behavior.safety_time > ttc > 0.0:
-            target_speed = min([
-                positive(vehicle_speed - self._behavior.speed_decrease),
-                self._behavior.max_speed,
-                self._speed_limit - self._behavior.speed_lim_dist])
-            self._local_planner.set_speed(target_speed)
-            control = self._local_planner.run_step(debug=debug)
+        vehicle_state, vehicle, distance = self.collision_and_car_avoid_manager(waypoint)
+        if not vehicle_state:
+            return None
+        if self._should_ignore_vehicle(vehicle):
+            return None
 
-        # Actual safety distance area, try to follow the speed of the vehicle in front.
-        elif 2 * self._behavior.safety_time > ttc >= self._behavior.safety_time:
-            target_speed = min([
-                max(self._min_speed, vehicle_speed),
-                self._behavior.max_speed,
-                self._speed_limit - self._behavior.speed_lim_dist])
-            self._local_planner.set_speed(target_speed)
-            control = self._local_planner.run_step(debug=debug)
+        distance = self._bbox_adjusted_distance(vehicle, distance)
+        if distance < self._effective_braking_distance():
+            return self.emergency_stop()
+        return self.car_following_manager(vehicle, distance, debug=debug)
+    
+    def _should_ignore_vehicle(self, vehicle):
 
-        # Normal behavior.
-        else:
-            target_speed = min([
-                self._behavior.max_speed,
-                self._speed_limit - self._behavior.speed_lim_dist])
-            self._local_planner.set_speed(target_speed)
-            control = self._local_planner.run_step(debug=debug)
-
-        return control
-
-    def _obstacle_still_present(self, road_id, lane_id, max_check_distance=None):
-        all_props = self._world.get_actors().filter("static.prop.*")
-        ego_loc = self._vehicle.get_location()
-        ego_fwd = self._vehicle.get_transform().get_forward_vector()
-        for prop in all_props:
-            prop_wp = self._map.get_waypoint(prop.get_location(), lane_type=carla.LaneType.Any)
-            if prop_wp.road_id == road_id and prop_wp.lane_id == lane_id:
-                to_prop = prop.get_location() - ego_loc
-                longitudinal = to_prop.x * ego_fwd.x + to_prop.y * ego_fwd.y
-                if longitudinal > 0:
-                    if max_check_distance is None or prop.get_location().distance(ego_loc) < max_check_distance:
-                        return True
-        return False
-
-    def _oncoming_lane_clear(self, lane_offset=-1, max_distance=40.0):
-        """
-        Vérifie en temps réel si la voie opposée est libre de tout véhicule venant
-        en face. Doit être appelée à CHAQUE tick pendant tout le dépassement,
-        pas seulement au moment de décider de le commencer.
-        """
-        all_vehicles = list(self._world.get_actors().filter("*vehicle*"))
-        lane_blocked, blocker, blocker_dist = self._vehicle_obstacle_detected(
-            all_vehicles, max_distance=max_distance, up_angle_th=180, lane_offset=lane_offset
+        return (
+            self._bypassing
+            and self._bypassed_vehicle is not None
+            and vehicle.id == self._bypassed_vehicle.id
         )
-        return not lane_blocked, blocker
 
-    def overtake_manager(self, ego_wp, vehicle=None, distance=None):
-        """
-        Contrôleur réactif de dépassement. Appelé à chaque tick tant qu'un
-        dépassement est en cours ou nécessaire. Contrairement à l'ancien plan
-        figé, il réévalue à chaque tick :
-        - si un véhicule arrive en face (abandon/pause du dépassement)
-        - si l'obstacle d'origine est encore là (moment de rentrer dans la voie)
+#----------------------------------------------------------------------------------------------#
+# OBJECT DETECTION
+#----------------------------------------------------------------------------------------------#
 
-        États : 'IDLE' -> 'CROSSING' -> 'MERGING_BACK' -> 'IDLE'
-        """
+    def _is_obstacle_in_lane(self, obstacle, waypoint):
 
-        # --- État 1 : pas encore en dépassement, on évalue s'il faut en démarrer un ---
-        if self._overtake_state == 'IDLE':
-            if vehicle is None or 'static.prop' not in vehicle.type_id:
-                return None
-            if self._speed > 8.0 or distance > 30.0:
-                return None
+        _, lateral = self._road_projection(obstacle, waypoint)
+        obstacle_half_width = max(obstacle.bounding_box.extent.x, obstacle.bounding_box.extent.y)
+        return (abs(lateral) - obstacle_half_width) < (waypoint.lane_width / 2.0 + self.BYPASS_LANE_OVERLAP_MARGIN)
 
-            clear, blocker = self._oncoming_lane_clear(lane_offset=-1)
-            if not clear:
-                print(f"[Overtake] En attente : véhicule en face ({blocker.type_id if blocker else '?'})")
-                return self.emergency_stop()
+    def _is_cyclist(self, actor):
 
-            target_wp = ego_wp.get_left_lane()
-            if target_wp is None or target_wp.lane_type != carla.LaneType.Driving:
-                print("[Overtake] Pas de voie opposée exploitable")
-                return None
+        return any(keyword in actor.type_id for keyword in self.CYCLIST_TYPE_KEYWORDS)
 
-            self._overtake_state = 'CROSSING'
-            self._original_lane_id = ego_wp.lane_id 
-            self._original_road_id = ego_wp.road_id
-            self._pre_overtake_plan = list(self._local_planner.get_plan())
-            print("[Overtake] Départ du dépassement sur la gauche")
-            # continue directement en CROSSING sur ce même tick
+    def _update_cyclist_clearance(self, waypoint, vehicle):
 
-        # --- État 2 : on roule sur la voie opposée, tant que l'obstacle est encore là ---
-        if self._overtake_state == 'CROSSING':
-            clear, blocker = self._oncoming_lane_clear(lane_offset=-1, max_distance=25.0)
-            if not clear:
-                print(f"[Overtake] Véhicule en face détecté en pleine traversée "
-                    f"({blocker.type_id if blocker else '?'}) — freinage")
-                return self.emergency_stop()
+        if vehicle is None or not self._is_cyclist(vehicle):
+            self._local_planner.set_offset(0)
+            return
 
-            self._crossing_tick_counter = getattr(self, '_crossing_tick_counter', 0) + 1
+        r_vec = waypoint.transform.get_right_vector()
+        origin = waypoint.transform.location
+        loc = vehicle.get_location()
+        lateral = (loc.x - origin.x) * r_vec.x + (loc.y - origin.y) * r_vec.y
 
-            need_new_plan = (
-                not hasattr(self, '_crossing_plan_ticks')
-                or self._crossing_tick_counter - self._crossing_plan_ticks >= 15
-            )
+        offset = -self.CYCLIST_CLEARANCE_OFFSET if lateral > 0 else self.CYCLIST_CLEARANCE_OFFSET
+        self._local_planner.set_offset(offset)
 
-            if need_new_plan:
-                current_ego_wp = self._map.get_waypoint(self._vehicle.get_location())
-                left_wp = current_ego_wp.get_left_lane()
-                if left_wp is None or left_wp.lane_type != carla.LaneType.Driving:
-                    left_wp = current_ego_wp
+    def _static_obstacle_ahead(self, waypoint):
 
-                plan = [(left_wp, RoadOption.CHANGELANELEFT)]
-                step_wp = left_wp
-                for _ in range(10):          # horizon ~30 m au lieu de ~9 m
-                    nexts = step_wp.next(3.0)
-                    if not nexts:
-                        break
-                    step_wp = nexts[0]
-                    plan.append((step_wp, RoadOption.LANEFOLLOW))
+        obstacle_list = self._build_obstacle_list(waypoint, max_distance=self.BYPASS_DETECTION_DISTANCE)
+        static_list = [o for o in obstacle_list if "static.prop" in o.type_id]
+        obstacle_state, obstacle, distance = self._vehicle_obstacle_detected(
+            static_list, self.BYPASS_DETECTION_DISTANCE, up_angle_th=self.FORWARD_ANGLE_STRAIGHT)
+        if obstacle_state and not self._is_obstacle_in_lane(obstacle, waypoint):
+            return False, None, -1
+        return obstacle_state, obstacle, distance
 
-                self._local_planner.set_global_plan(plan, stop_waypoint_creation=True, clean_queue=True)
-                self._local_planner.set_speed(15)
-                self._crossing_plan_ticks = self._crossing_tick_counter
 
-            still_present = self._obstacle_still_present(self._original_road_id, self._original_lane_id)
+    def _update_stall_tracking(self, vehicle):
 
-            control = self._local_planner.run_step()
+        if self._speed > self.STALL_MIN_EGO_MOVED_SPEED_KMH:
+            self._ego_has_moved_normally = True
 
-            if self._crossing_tick_counter % 20 == 0:
-                print(f"[Overtake][CROSSING] speed={self._speed:.1f} "
-                    f"steer={control.steer:.3f} throttle={control.throttle:.2f} "
-                    f"still_present={still_present}")
+        if vehicle is None or get_speed(vehicle) > self.STALL_SPEED_THRESHOLD:
+            self._stalled_vehicle_id = None
+            self._stalled_tick_counter = 0
+            self._ego_blocked_tick_counter = 0
+            return
 
-            if not still_present:
-                self._overtake_state = 'MERGING_BACK'
-                self._crossing_tick_counter = 0
-                if hasattr(self, '_crossing_plan_ticks'):
-                    del self._crossing_plan_ticks
-                print("[Overtake] Obstacle dépassé — retour sur la voie d'origine")
+        if vehicle.id != self._stalled_vehicle_id:
+            self._stalled_vehicle_id = vehicle.id
+            self._stalled_tick_counter = 0
+            self._ego_blocked_tick_counter = 0
+            return
 
-            return control
+        self._stalled_tick_counter += 1
+        if self._speed <= self.EGO_BLOCKED_SPEED_THRESHOLD:
+            self._ego_blocked_tick_counter += 1
+        else:
+            self._ego_blocked_tick_counter = 0
 
-        # --- État 3 : on revient sur la voie d'origine ---
-        if self._overtake_state == 'MERGING_BACK':
-            current_ego_wp = self._map.get_waypoint(self._vehicle.get_location())
-            ego_loc = self._vehicle.get_location()
+    def _stalled_vehicle_confirmed(self):
 
-            target_wp = self._map.get_waypoint_xodr(
-                self._original_road_id, self._original_lane_id, current_ego_wp.s
-            )
+        if (not self._ego_has_moved_normally
+                and self._ego_blocked_tick_counter <= self.STALL_STARTUP_HARD_BLOCK_TICKS):
+            return False
+        if self._tick_count <= self.STALL_STARTUP_GRACE_TICKS:
+            return False
+        return (self._stalled_tick_counter > self.STALL_TIMEOUT_TICKS
+                and self._ego_blocked_tick_counter > self.EGO_BLOCKED_CONFIRM_TICKS)
 
-            if target_wp is None:
-                target_wp = current_ego_wp
+    def _near_junction(self, location, distance):
 
-            dist_to_target = target_wp.transform.location.distance(ego_loc)
+        wp = self._map.get_waypoint(location)
+        if wp.is_junction:
+            return True
+        ahead = wp.next(distance)
+        return any(w.is_junction for w in ahead)
 
-            if dist_to_target < 1.2:
-                self._merge_confirm_ticks = getattr(self, '_merge_confirm_ticks', 0) + 1
-            else:
-                self._merge_confirm_ticks = 0
+    def _cyclist_ahead(self, waypoint):
 
-            if self._merge_confirm_ticks >= 8:
-                self._overtake_state = 'IDLE'
-                self._merging_tick_counter = 0
-                self._merge_confirm_ticks = 0
+        obstacle_list = self._build_obstacle_list(waypoint, max_distance=self.BYPASS_DETECTION_DISTANCE)
+        cyclist_list = [o for o in obstacle_list if self._is_cyclist(o)]
+        state, cyclist, distance = self._vehicle_obstacle_detected(
+            cyclist_list, self.BYPASS_DETECTION_DISTANCE, up_angle_th=self.FORWARD_ANGLE_STRAIGHT)
+        if state and not self._is_obstacle_in_lane(cyclist, waypoint):
+            return False, None, -1
+        return state, cyclist, distance
 
-                saved_plan = getattr(self, '_pre_overtake_plan', None)
-                if saved_plan:
-                    ego_loc = self._vehicle.get_location()
-                    ego_forward = self._vehicle.get_transform().get_forward_vector()
+    def _stalled_vehicle_ahead(self, waypoint):
 
-                    def is_ahead(wp_tuple):
-                        to_wp = wp_tuple[0].transform.location - ego_loc
-                        return (to_wp.x * ego_forward.x + to_wp.y * ego_forward.y) > 0
+        obstacle_list = self._build_obstacle_list(waypoint, max_distance=self.BYPASS_DETECTION_DISTANCE)
+        vehicle_state, vehicle, distance = self._vehicle_obstacle_detected(
+            obstacle_list, self.BYPASS_DETECTION_DISTANCE, up_angle_th=self.FORWARD_ANGLE_STRAIGHT)
 
-                    ahead_candidates = [(i, wp) for i, wp in enumerate(saved_plan) if is_ahead(wp)]
+        if vehicle_state and self._is_cyclist(vehicle):
+            vehicle_state = False
 
-                    if ahead_candidates:
-                        closest_idx = min(
-                            ahead_candidates,
-                            key=lambda pair: pair[1][0].transform.location.distance(ego_loc)
-                        )[0]
-                    else:
-                        # Tout le plan sauvegardé est derrière nous : on saute directement à la fin
-                        closest_idx = len(saved_plan) - 1
+        if vehicle_state and vehicle.id in self._vehicles_seen_moving:
+            self._update_stall_tracking(None)
+            return False, None, -1
 
-                    resume_plan = saved_plan[closest_idx + 1:]
-                    if resume_plan:
-                        self._local_planner.set_global_plan(
-                            resume_plan, stop_waypoint_creation=False, clean_queue=True
-                        )
-                    else:
-                        self._local_planner._stop_waypoint_creation = False
-                else:
-                    self._local_planner._stop_waypoint_creation = False
+        if vehicle_state and (
+                self._near_junction(waypoint.transform.location, self.JUNCTION_STALL_EXCLUSION_DISTANCE)
+                or self._near_junction(vehicle.get_location(), self.JUNCTION_STALL_EXCLUSION_DISTANCE)):
+            self._update_stall_tracking(None)
+            return False, None, -1
 
-                self._pre_overtake_plan = None
-                print("[Overtake] Retour terminé")
-                return None
-            
-            plan = [(target_wp, RoadOption.CHANGELANERIGHT)]
-            step_wp = target_wp
-            for _ in range(6):
-                nexts = step_wp.next(3.0)
-                if not nexts:
-                    break
-                step_wp = nexts[0]
-                plan.append((step_wp, RoadOption.LANEFOLLOW))
+        self._update_stall_tracking(vehicle if vehicle_state else None)
+        if (vehicle_state and self._stalled_vehicle_confirmed()
+                and self._is_obstacle_in_lane(vehicle, waypoint)):
+            return True, vehicle, distance
+        return False, None, -1
 
-            self._local_planner.set_global_plan(plan, stop_waypoint_creation=True, clean_queue=True)
-            self._local_planner.set_speed(15)
 
-            self._merging_tick_counter = getattr(self, '_merging_tick_counter', 0) + 1
-            if self._merging_tick_counter % 10 == 0:
-                print(f"[Overtake][MERGING_BACK] target_road={self._original_road_id} "
-                      f"target_lane={self._original_lane_id} dist_to_target={dist_to_target:.2f} "
-                      f"confirm_ticks={self._merge_confirm_ticks} speed={self._speed:.1f}")
+    def _blocking_obstacle_ahead(self, waypoint):
 
-            return self._local_planner.run_step()
+        static_state, static_obstacle, static_distance = self._static_obstacle_ahead(waypoint)
+        if static_state:
+            return static_state, static_obstacle, static_distance
+        
+        cyclist_state, cyclist, cyclist_distance = self._cyclist_ahead(waypoint)
+        if cyclist_state:
+            return cyclist_state, cyclist, cyclist_distance
 
-        return None
+        return self._stalled_vehicle_ahead(waypoint)
+
+    def _oncoming_lane_obstacle(self, waypoint):
+
+        opposite_wp = waypoint.get_left_lane()
+        if opposite_wp is None or opposite_wp.lane_type != carla.LaneType.Driving:
+            return False, None, -1
+
+        ego_loc = waypoint.transform.location
+        fwd = waypoint.transform.get_forward_vector()
+
+        nearest_vehicle = None
+        nearest_distance = None
+        for vehicle in self._actors.filter("*vehicle*"):
+            if vehicle.id == self._vehicle.id:
+                continue
+            v_loc = vehicle.get_location()
+            distance = v_loc.distance(ego_loc)
+            if distance >= self.BYPASS_DETECTION_DISTANCE:
+                continue
+
+            v_wp = self._map.get_waypoint(v_loc, lane_type=carla.LaneType.Any)
+            if v_wp.road_id != opposite_wp.road_id or v_wp.lane_id != opposite_wp.lane_id:
+                continue
+
+            if (v_loc.x - ego_loc.x) * fwd.x + (v_loc.y - ego_loc.y) * fwd.y <= 0:
+                continue
+
+            if nearest_distance is None or distance < nearest_distance:
+                nearest_vehicle = vehicle
+                nearest_distance = distance
+
+        if nearest_vehicle is None:
+            return False, None, -1
+        return True, nearest_vehicle, nearest_distance
+
+#----------------------------------------------------------------------------------------------#
+#   RUN_STEP
+#----------------------------------------------------------------------------------------------#
+
+    def _clamp_to_speed_limit(self, target_speed):
+
+        return min(target_speed, self._speed_limit)
 
     def run_step(self, debug=False):
         """
@@ -459,68 +1479,110 @@ class BehaviorAgent(BasicAgent):
             :return control: carla.VehicleControl
         """
         self._update_information()
-        loc = self._vehicle.get_location()
-        vel = self._vehicle.get_velocity()
-        self._tick_counter_global = getattr(self, '_tick_counter_global', 0) + 1
-        if self._tick_counter_global % 10 == 0:
-            print(f"[Position] tick={self._tick_counter_global} "
-                f"x={loc.x:.2f} y={loc.y:.2f} z={loc.z:.2f} "
-                f"vel=({vel.x:.2f},{vel.y:.2f},{vel.z:.2f}) speed_reported={self._speed:.2f}")
+        self._tick_count += 1
 
         control = None
         if self._behavior.tailgate_counter > 0:
             self._behavior.tailgate_counter -= 1
-        if self._overtake_state != 'IDLE':
-            ego_vehicle_wp = self._map.get_waypoint(self._vehicle.get_location())
-            result = self.overtake_manager(ego_vehicle_wp)
-            if result is not None:
-                return result
 
         ego_vehicle_loc = self._vehicle.get_location()
         ego_vehicle_wp = self._map.get_waypoint(ego_vehicle_loc)
+        self._log_vehicle_state(ego_vehicle_wp)
 
-        # 1: Red lights and stops behavior
+        # 1a: Red lights behavior
         if self.traffic_light_manager():
             return self.emergency_stop()
 
-        # 2.1: Pedestrian avoidance behaviors
-        walker_state, walker, w_distance = self.pedestrian_avoid_manager(ego_vehicle_wp)
+        # 1b: Stop-sign compliance
+        stop_control = self.stop_sign_manager(debug=debug)
+        if stop_control is not None:
+            return stop_control
+
+        # 2: Pedestrian avoidance behaviors
+        walker_state, walker, ttc, w_distance = self.pedestrian_avoid_manager(ego_vehicle_wp)
 
         if walker_state:
-            distance = w_distance - max(
-                walker.bounding_box.extent.y, walker.bounding_box.extent.x) - max(
-                    self._vehicle.bounding_box.extent.y, self._vehicle.bounding_box.extent.x)
-            if distance < self._behavior.braking_distance:
+            self._update_pedestrian_wait_tracking(walker)
+            distance = (w_distance 
+                        - max(walker.bounding_box.extent.x, walker.bounding_box.extent.y)
+                        - max(self._vehicle.bounding_box.extent.x,self._vehicle.bounding_box.extent.y))
+            
+            if(ttc <= self.PEDESTRIAN_STOP_TTC or distance < self._effective_braking_distance()):
                 return self.emergency_stop()
 
-        # 2.2: Car following behaviors
+            elif ttc <= self.PEDESTRIAN_SLOWDOWN_TTC:
+                self._local_planner.set_speed(min(10,self._speed_limit))
+                return self._local_planner.run_step(debug=debug)
+        else:
+            self._update_pedestrian_wait_tracking(None)
+
+        # 3: Control loss correction
+        if self.control_loss_manager(ego_vehicle_wp):
+            target_speed = min([
+                self._control_loss_stabilize_speed(),
+                self._behavior.max_speed])
+            self._local_planner.set_speed(self._clamp_to_speed_limit(target_speed))
+            return self._local_planner.run_step(debug=debug)
+        
+        # 4a: Construction-zone bypass 
+        constr_control = self.construction_zone_manager(ego_vehicle_wp, debug=debug)
+        if constr_control is not None:
+            return constr_control
+
+        # 4b: Static obstacle bypass behavior (accident/parked vehicle)
+        if self.bypass_obstacle_manager(ego_vehicle_wp):
+            blocking_control = self._react_to_moving_obstacle(ego_vehicle_wp, debug=debug)
+            if blocking_control is not None:
+                return blocking_control
+
+            target_speed = min([
+                self._behavior.max_speed,
+                self._speed_limit - self._behavior.speed_lim_dist])
+
+            if self._bypassing and self._bypass_use_offset:
+                self._local_planner.set_offset(self._bypass_offset)
+                target_speed *= self.BYPASS_OVERTAKE_SPEED_FACTOR
+
+            self._local_planner.set_speed(self._clamp_to_speed_limit(target_speed))
+            return self._local_planner.run_step(debug=debug)
+
+        # 5: Car following behaviors
         vehicle_state, vehicle, distance = self.collision_and_car_avoid_manager(ego_vehicle_wp)
 
+        # 6: Keep a lateral gap from a cyclist ahead without changing lane.
+        self._update_cyclist_clearance(ego_vehicle_wp, vehicle if vehicle_state else None)
+
         if vehicle_state:
+            # Distance is computed from the center of the two cars,
+            # we use bounding boxes to calculate the actual distance
             distance = distance - max(
                 vehicle.bounding_box.extent.y, vehicle.bounding_box.extent.x) - max(
                     self._vehicle.bounding_box.extent.y, self._vehicle.bounding_box.extent.x)
 
-            result = self.overtake_manager(ego_vehicle_wp, vehicle, distance)
-            if result is not None:
-                return result
-
-            if distance < self._behavior.braking_distance:
+            # Emergency brake if the car is very close (distance threshold
+            # scales with current speed, see _effective_braking_distance).
+            if distance < self._effective_braking_distance():
                 return self.emergency_stop()
             else:
                 control = self.car_following_manager(vehicle, distance)
 
-        # 3: Intersection behavior
-        elif self._incoming_waypoint.is_junction and (self._incoming_direction in [RoadOption.LEFT, RoadOption.RIGHT]):
-            target_speed = min([self._behavior.max_speed, self._speed_limit - 5])
-            self._local_planner.set_speed(target_speed)
-            control = self._local_planner.run_step(debug=debug)
-            
+        # 7: Junction behavior
+        elif self._junction_ahead():
+            if self.junction_manager(ego_vehicle_wp):
+                control = self._hold_position(debug=debug)
+            else:
+                target_speed = min([
+                    self._behavior.max_speed,
+                    self._speed_limit - 5])
+                self._local_planner.set_speed(self._clamp_to_speed_limit(target_speed))
+                control = self._local_planner.run_step(debug=debug)
 
-        # 4: Normal behavior
+        # 8: Normal behavior
         else:
-            target_speed = min([self._behavior.max_speed, self._speed_limit - self._behavior.speed_lim_dist])
-            self._local_planner.set_speed(target_speed)
+            target_speed = min([
+                self._behavior.max_speed,
+                self._speed_limit - self._behavior.speed_lim_dist])
+            self._local_planner.set_speed(self._clamp_to_speed_limit(target_speed))
             control = self._local_planner.run_step(debug=debug)
 
         return control

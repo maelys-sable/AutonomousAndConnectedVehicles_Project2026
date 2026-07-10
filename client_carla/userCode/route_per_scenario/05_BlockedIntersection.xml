@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<routes>
+<route id="0" town="Town12">
+  <!-- ISOLATED TEST: BlockedIntersection | source instance: BlockedIntersection_1 (idx 1)
+       blocked intersection -->
+  <weathers>
+	<weather route_percentage="0"
+		cloudiness="60.0" precipitation="30.0" precipitation_deposits="50.0" wetness="60.0"
+		wind_intensity="30.0" sun_azimuth_angle="-1.0" sun_altitude_angle="-90.0" fog_density="3.0"/>
+	<weather route_percentage="100"
+		cloudiness="60.0" precipitation="30.0" precipitation_deposits="50.0" wetness="60.0"
+		wind_intensity="30.0" sun_azimuth_angle="-1.0" sun_altitude_angle="-90.0" fog_density="3.0"/>
+  </weathers>
+  <waypoints>
+	 <position x="-1474.7" y="1607.9" z="325.7"/>
+	 <position x="-1732.6" y="1605.7" z="328.2"/>
+	 <position x="-1782.7" y="1504.8" z="330.1"/>
+	 <position x="-1899.2" y="1429.8" z="328.3"/>
+  </waypoints>
+  <scenarios>
+	 <scenario name="BlockedIntersection_1" type="BlockedIntersection">
+		<trigger_point x="-1732.6" y="1605.7" z="328.2" yaw="-179.5"/></scenario>
+  </scenarios>
+</route>
+</routes>

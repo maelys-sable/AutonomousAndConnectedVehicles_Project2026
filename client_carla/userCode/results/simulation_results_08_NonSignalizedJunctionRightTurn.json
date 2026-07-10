@@ -3,14 +3,14 @@
         "global_record": {
             "index": -1,
             "route_id": -1,
-            "status": "Failed",
+            "status": "Completed",
             "infractions": {
-                "collisions_layout": 5.137,
+                "collisions_layout": 0.0,
                 "collisions_pedestrian": 0.0,
-                "collisions_vehicle": 0.0,
+                "collisions_vehicle": 1.789,
                 "red_light": 0.0,
                 "stop_infraction": 0.0,
-                "outside_route_lanes": 0.01,
+                "outside_route_lanes": 0.003,
                 "min_speed_infractions": 0.0,
                 "yield_emergency_vehicles_infractions": 0.0,
                 "scenario_timeouts": 0.0,
@@ -19,9 +19,9 @@
                 "route_timeout": 0.0
             },
             "scores_mean": {
-                "score_composed": 4.997345,
-                "score_route": 12.14,
-                "score_penalty": 0.411643
+                "score_composed": 59.651833,
+                "score_route": 100.0,
+                "score_penalty": 0.596518
             },
             "scores_std_dev": {
                 "score_composed": "NaN",
@@ -29,13 +29,7 @@
                 "score_penalty": "NaN"
             },
             "meta": {
-                "exceptions": [
-                    [
-                        "RouteScenario_1_rep0",
-                        0,
-                        "Failed"
-                    ]
-                ]
+                "exceptions": []
             }
         },
         "progress": [
@@ -45,20 +39,19 @@
         "records": [
             {
                 "index": 0,
-                "route_id": "RouteScenario_1_rep0",
-                "status": "Failed",
-                "num_infractions": 3,
+                "route_id": "RouteScenario_0_rep0",
+                "status": "Completed",
+                "num_infractions": 2,
                 "infractions": {
-                    "collisions_layout": [
-                        "Agent collided against object with type=static.prop.constructioncone and id=18846 at (x=-1376.517, y=1608.193, z=327.792)",
-                        "Agent collided against object with type=static.prop.constructioncone and id=18845 at (x=-1381.094, y=1610.255, z=327.927)"
-                    ],
+                    "collisions_layout": [],
                     "collisions_pedestrian": [],
-                    "collisions_vehicle": [],
+                    "collisions_vehicle": [
+                        "Agent collided against object with type=vehicle.nissan.patrol_2021 and id=41056 at (x=-3660.536, y=1159.485, z=349.183)"
+                    ],
                     "red_light": [],
                     "stop_infraction": [],
                     "outside_route_lanes": [
-                        "Agent went outside its route lanes for about 10.001 meters (2.57% of the completed route)"
+                        "Agent went outside its route lanes for about 3.221 meters (0.58% of the completed route)"
                     ],
                     "min_speed_infractions": [],
                     "yield_emergency_vehicles_infractions": [],
@@ -68,14 +61,14 @@
                     "route_timeout": []
                 },
                 "scores": {
-                    "score_route": 12.14,
-                    "score_penalty": 0.411643,
-                    "score_composed": 4.997345
+                    "score_route": 100,
+                    "score_penalty": 0.596518,
+                    "score_composed": 59.651833
                 },
                 "meta": {
-                    "route_length": 3206.913,
-                    "duration_game": 104.9,
-                    "duration_system": 226.389
+                    "route_length": 559.093,
+                    "duration_game": 93.45,
+                    "duration_system": 156.191
                 }
             }
         ]
@@ -91,15 +84,15 @@
         "carla_speedometer"
     ],
     "values": [
-        "4.997345",
-        "12.14",
-        "0.411643",
+        "59.651833",
+        "100.0",
+        "0.596518",
+        "0.0",
+        "1.789",
         "0.0",
         "0.0",
-        "5.137",
         "0.0",
-        "0.0",
-        "0.01",
+        "0.003",
         "0.0",
         "0.0",
         "0.0",
