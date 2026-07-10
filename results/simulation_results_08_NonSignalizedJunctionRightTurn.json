@@ -7,11 +7,11 @@
             "infractions": {
                 "collisions_layout": 0.0,
                 "collisions_pedestrian": 0.0,
-                "collisions_vehicle": 0.0,
+                "collisions_vehicle": 1.789,
                 "red_light": 0.0,
                 "stop_infraction": 0.0,
-                "outside_route_lanes": 0,
-                "min_speed_infractions": 1.835,
+                "outside_route_lanes": 0.003,
+                "min_speed_infractions": 0.0,
                 "yield_emergency_vehicles_infractions": 0.0,
                 "scenario_timeouts": 0.0,
                 "route_dev": 0.0,
@@ -19,9 +19,9 @@
                 "route_timeout": 0.0
             },
             "scores_mean": {
-                "score_composed": 94.489,
+                "score_composed": 59.651833,
                 "score_route": 100.0,
-                "score_penalty": 0.94489
+                "score_penalty": 0.596518
             },
             "scores_std_dev": {
                 "score_composed": "NaN",
@@ -41,17 +41,19 @@
                 "index": 0,
                 "route_id": "RouteScenario_0_rep0",
                 "status": "Completed",
-                "num_infractions": 1,
+                "num_infractions": 2,
                 "infractions": {
                     "collisions_layout": [],
                     "collisions_pedestrian": [],
-                    "collisions_vehicle": [],
+                    "collisions_vehicle": [
+                        "Agent collided against object with type=vehicle.nissan.patrol_2021 and id=41056 at (x=-3660.536, y=1159.485, z=349.183)"
+                    ],
                     "red_light": [],
                     "stop_infraction": [],
-                    "outside_route_lanes": [],
-                    "min_speed_infractions": [
-                        "Average speed is 81.63% of the surrounding traffic's one"
+                    "outside_route_lanes": [
+                        "Agent went outside its route lanes for about 3.221 meters (0.58% of the completed route)"
                     ],
+                    "min_speed_infractions": [],
                     "yield_emergency_vehicles_infractions": [],
                     "scenario_timeouts": [],
                     "route_dev": [],
@@ -60,13 +62,13 @@
                 },
                 "scores": {
                     "score_route": 100,
-                    "score_penalty": 0.94489,
-                    "score_composed": 94.489
+                    "score_penalty": 0.596518,
+                    "score_composed": 59.651833
                 },
                 "meta": {
-                    "route_length": 544.942,
-                    "duration_game": 57.65,
-                    "duration_system": 90.616
+                    "route_length": 559.093,
+                    "duration_game": 93.45,
+                    "duration_system": 156.191
                 }
             }
         ]
@@ -82,21 +84,21 @@
         "carla_speedometer"
     ],
     "values": [
-        "94.489",
+        "59.651833",
         "100.0",
-        "0.94489",
+        "0.596518",
+        "0.0",
+        "1.789",
+        "0.0",
+        "0.0",
+        "0.0",
+        "0.003",
         "0.0",
         "0.0",
         "0.0",
         "0.0",
         "0.0",
-        "0",
-        "0.0",
-        "0.0",
-        "0.0",
-        "0.0",
-        "0.0",
-        "1.835"
+        "0.0"
     ],
     "labels": [
         "Avg. driving score",
