@@ -679,12 +679,37 @@ class BehaviorAgent(BasicAgent):
 
     def _oncoming_lane_obstacle(self, waypoint):
 
-        actors = self._actors.filter("*vehicle*")
-        def dist(v): return v.get_location().distance(waypoint.transform.location)
-        vehicle_list = [v for v in actors if dist(v) < self.BYPASS_DETECTION_DISTANCE and v.id != self._vehicle.id]
-        return self._vehicle_obstacle_detected(
-            vehicle_list, self.BYPASS_DETECTION_DISTANCE, up_angle_th=180, lane_offset=-1)
+        opposite_wp = waypoint.get_left_lane()
+        if opposite_wp is None or opposite_wp.lane_type != carla.LaneType.Driving:
+            return False, None, -1
 
+        ego_loc = waypoint.transform.location
+        fwd = waypoint.transform.get_forward_vector()
+
+        nearest_vehicle = None
+        nearest_distance = None
+        for vehicle in self._actors.filter("*vehicle*"):
+            if vehicle.id == self._vehicle.id:
+                continue
+            v_loc = vehicle.get_location()
+            distance = v_loc.distance(ego_loc)
+            if distance >= self.BYPASS_DETECTION_DISTANCE:
+                continue
+
+            v_wp = self._map.get_waypoint(v_loc, lane_type=carla.LaneType.Any)
+            if v_wp.road_id != opposite_wp.road_id or v_wp.lane_id != opposite_wp.lane_id:
+                continue
+
+            if (v_loc.x - ego_loc.x) * fwd.x + (v_loc.y - ego_loc.y) * fwd.y <= 0:
+                continue
+
+            if nearest_distance is None or distance < nearest_distance:
+                nearest_vehicle = vehicle
+                nearest_distance = distance
+
+        if nearest_vehicle is None:
+            return False, None, -1
+        return True, nearest_vehicle, nearest_distance
 #----------------------------------------------------------------------------------------------#
 # BYPASS
 #----------------------------------------------------------------------------------------------#
@@ -705,19 +730,20 @@ class BehaviorAgent(BasicAgent):
         return time_to_arrival >= min_gap_time
 
     def _oncoming_gap_clear(self, waypoint):
-        """
-        Gap acceptance before pulling into the opposite (left) lane to
-        bypass an obstacle: returns True only if no oncoming vehicle is
-        close enough to make the manoeuvre unsafe.
 
-            :param waypoint: the agent's current waypoint
-            :return: True if it is safe to move into the oncoming lane
-        """
         oncoming_state, oncoming_vehicle, oncoming_distance = self._oncoming_lane_obstacle(waypoint)
         if not oncoming_state:
             return True
-        return self._gap_is_safe(oncoming_distance, get_speed(oncoming_vehicle))
-
+        
+        oncoming_speed = get_speed(oncoming_vehicle)
+        safe = self._gap_is_safe(oncoming_distance, oncoming_speed)
+        print(
+            f"[BYPASS] Oncoming check: {oncoming_vehicle.type_id}(id={oncoming_vehicle.id}) "
+            f"dist={oncoming_distance:.1f}m speed={oncoming_speed:.1f}km/h "
+            f"-> {'CLEAR, overtaking' if safe else 'BLOCKED, yielding'}"
+        )
+        return safe  
+      
     def _obstacle_cleared(self):
 
         if self._bypassed_vehicle is None:
