@@ -82,6 +82,16 @@ class BehaviorAgent(BasicAgent):
 
     STOP_SIGN_SPEED_EPSILON = 0.5       
 
+    # Creep-to-line: instead of hard-braking the moment a stop sign is
+    # detected (which stops the ego several metres short of the actual
+    # trigger volume and lets it roll through the real line afterwards),
+    # the ego rolls slowly forward until it is at the line, then makes its
+    # full stop inside the trigger volume where CARLA expects it.
+    STOP_LINE_TOLERANCE = 2.0          # distance to trigger volume that counts as "at the line" (m)
+    STOP_CREEP_SPEED_KMH = 8.0         # max creep speed while approaching the line (km/h)
+    STOP_CREEP_MIN_SPEED_KMH = 3.0     # floor so the creep never stalls before reaching the line
+    STOP_FULL_STOP_TICKS = 40          # consecutive ticks below EPSILON needed to validate the stop
+
     STALL_SPEED_THRESHOLD = 1.0    
     STALL_TIMEOUT_TICKS = 150      
     EGO_BLOCKED_SPEED_THRESHOLD = 2.0    
@@ -235,13 +245,14 @@ class BehaviorAgent(BasicAgent):
 
         sid = f" id={stop_sign.id}" if stop_sign is not None else ""
         messages = {
-            'stopping': f"[STOP] Stop sign ahead{sid} -> braking to a full stop",
+            'creeping': f"[STOP] Stop sign ahead{sid} -> creeping up to the line",
+            'stopping': f"[STOP] At the stop line{sid} -> braking to a full stop",
             'cleared':  f"[STOP] Full stop registered{sid} -> proceeding",
         }
         msg = messages.get(event)
         if msg is None:
             return
-        if event == 'stopping' and (self._tick_count % self.STATE_LOG_INTERVAL) != 0:
+        if event in ('creeping', 'stopping') and (self._tick_count % self.STATE_LOG_INTERVAL) != 0:
             return
         print(msg)
 
@@ -374,9 +385,24 @@ class BehaviorAgent(BasicAgent):
 
         return affected
 
-    def stop_sign_manager(self):
+    def _distance_to_stop_line(self, stop_sign, ego_loc):
+
+        trigger_wp = self._stop_map.get(stop_sign.id)
+        if trigger_wp is None:
+            return None
+        return trigger_wp.transform.location.distance(ego_loc)
+
+    def _stop_creep_speed(self, distance_to_line):
+
+        span = max(self.STOP_SIGN_BASE_THRESHOLD, 1.0)
+        ratio = max(0.0, min(1.0, (distance_to_line - self.STOP_LINE_TOLERANCE) / span))
+        speed = self.STOP_CREEP_MIN_SPEED_KMH + ratio * (
+            self.STOP_CREEP_SPEED_KMH - self.STOP_CREEP_MIN_SPEED_KMH)
+        return speed
+
+    def stop_sign_manager(self, debug=False):
         """
-        Stop Management: Full stop + delay + targeted scan to the left.
+        Stop management with creep-to-line
         """
         affected, stop_sign = self._affected_by_stop_sign()
 
@@ -384,23 +410,32 @@ class BehaviorAgent(BasicAgent):
             self._target_stop_sign = None
             self._stop_sign_done_id = None
             self._stop_sign_ticks_frozen = 0
-            return False
+            return None
 
         if stop_sign.id == self._stop_sign_done_id:
-            return False
+            return None
 
         self._target_stop_sign = stop_sign.id
         ego_speed = get_speed(self._vehicle)
+        ego_loc = self._vehicle.get_location()
+        distance_to_line = self._distance_to_stop_line(stop_sign, ego_loc)
+
+        if distance_to_line is not None and distance_to_line > self.STOP_LINE_TOLERANCE:
+            self._log_stop_sign_transition('creeping', stop_sign)
+            self._stop_sign_ticks_frozen = 0
+            creep_speed = self._stop_creep_speed(distance_to_line)
+            self._local_planner.set_speed(self._clamp_to_speed_limit(creep_speed))
+            return self._local_planner.run_step(debug=debug)
 
         if ego_speed >= self.STOP_SIGN_SPEED_EPSILON:
             self._log_stop_sign_transition('stopping', stop_sign)
             self._stop_sign_ticks_frozen = 0
-            return True
+            return self._hold_position(debug=debug)
 
         self._stop_sign_ticks_frozen += 1
 
-        if self._stop_sign_ticks_frozen < 60:
-            return True
+        if self._stop_sign_ticks_frozen < self.STOP_FULL_STOP_TICKS:
+            return self._hold_position(debug=debug)
 
         ego_transform = self._vehicle.get_transform()
         ego_loc = ego_transform.location
@@ -412,25 +447,25 @@ class BehaviorAgent(BasicAgent):
         for actor in obstacle_list:
             if actor.id == self._vehicle.id or "vehicle" not in actor.type_id:
                 continue
-            
+
             target_loc = actor.get_location()
             distance = ego_loc.distance(target_loc)
 
             to_target = target_loc - ego_loc
 
             dot_product = to_target.x * ego_fwd.x + to_target.y * ego_fwd.y
-            
+
             cross_z = ego_fwd.x * to_target.y - ego_fwd.y * to_target.x
 
             if dot_product > 0 and cross_z < 0:
                 if get_speed(actor) > 10.0:
-                    return True
+                    return self._hold_position(debug=debug)
 
         self._stop_sign_done_id = stop_sign.id
         self._target_stop_sign = None
         self._stop_sign_ticks_frozen = 0
         self._log_stop_sign_transition('cleared', stop_sign)
-        return False
+        return None
 
 #----------------------------------------------------------------------------------------------#
 #   COLLISION AND CAR AVOID
@@ -1568,9 +1603,10 @@ class BehaviorAgent(BasicAgent):
         if self.traffic_light_manager():
             return self.emergency_stop()
 
-        # 1b: Stop-sign compliance
-        if self.stop_sign_manager():
-            return self._hold_position(debug=debug)
+        # 1b: Stop-sign compliance (creep to the line, stop, then proceed)
+        stop_control = self.stop_sign_manager(debug=debug)
+        if stop_control is not None:
+            return stop_control
 
         # 2.1: Pedestrian avoidance behaviors
         walker_state, walker, ttc, w_distance = self.pedestrian_avoid_manager(ego_vehicle_wp)
