@@ -147,9 +147,6 @@ class BehaviorAgent(BasicAgent):
         elif behavior == 'aggressive':
             self._behavior = Aggressive()
 
-        # Minimal bypass flags (the full bypass rework is handled separately).
-        # These must exist so run_step's bypass step doesn't raise before the
-        # tick can reach the car-following / cyclist-clearance logic.
         self._bypassing = False
         self._bypassed_vehicle = None
 
@@ -163,9 +160,6 @@ class BehaviorAgent(BasicAgent):
         self._bypass_best_offset = None   
         self._bypass_best_offset_tick = None
 
-        # Adaptive-offset overtake: whether the current manoeuvre uses a
-        # lateral offset (True) or a full lane-change fallback (False), and
-        # the offset magnitude to re-apply each tick.
         self._bypass_use_offset = False
         self._bypass_offset = 0.0
 
@@ -182,6 +176,7 @@ class BehaviorAgent(BasicAgent):
         self._target_stop_sign = None
         self._stop_sign_done_id = None
         self._stop_map = {}
+        self._stop_sign_ticks_frozen = 0
 
         # Stalled-vehicle tracking
         self._stalled_vehicle_id = None
@@ -354,35 +349,48 @@ class BehaviorAgent(BasicAgent):
 
     def stop_sign_manager(self):
         """
-        Management of driver behaviour at stop signs, including traffic monitoring.
+        Strict stop management: Mandatory full stop + delay + traffic scan.
         """
         affected, stop_sign = self._affected_by_stop_sign()
 
         if not affected:
             self._target_stop_sign = None
             self._stop_sign_done_id = None
+            self._stop_sign_ticks_frozen = 0
             return False
 
         if stop_sign.id == self._stop_sign_done_id:
             return False
 
         self._target_stop_sign = stop_sign.id
-        ego_waypoint = self._map.get_waypoint(self._vehicle.get_location())
+        ego_speed = get_speed(self._vehicle)
 
-        if get_speed(self._vehicle) < self.STOP_SIGN_SPEED_EPSILON:
+        if ego_speed >= self.STOP_SIGN_SPEED_EPSILON:
+            self._log_stop_sign_transition('stopping', stop_sign)
+            self._stop_sign_ticks_frozen = 0
+            return True
+
+        self._stop_sign_ticks_frozen += 1
+
+        if self._stop_sign_ticks_frozen < 60:
+            return True
+        
+        ego_loc = self._vehicle.get_location()
+        scan_distance = 50.0
+        obstacle_list = self._build_obstacle_list(self._map.get_waypoint(ego_loc), max_distance=scan_distance)
+
+        for actor in obstacle_list:
+            if actor.id == self._vehicle.id or "vehicle" not in actor.type_id:
+                continue
             
-            obstacle_state, obstacle_vehicle, obstacle_distance = self._cross_traffic_obstacle(ego_waypoint)
-            
-            if self._junction_gap_is_safe(obstacle_state, obstacle_vehicle, obstacle_distance):
-                self._stop_sign_done_id = stop_sign.id
-                self._target_stop_sign = None
-                self._log_stop_sign_transition('cleared', stop_sign)
-                return False
-            else:
+            if get_speed(actor) > 2.0:
                 return True
 
-        self._log_stop_sign_transition('stopping', stop_sign)
-        return True
+        self._stop_sign_done_id = stop_sign.id
+        self._target_stop_sign = None
+        self._stop_sign_ticks_frozen = 0
+        self._log_stop_sign_transition('cleared', stop_sign)
+        return False
 
 #----------------------------------------------------------------------------------------------#
 #   COLLISION AND CAR AVOID
