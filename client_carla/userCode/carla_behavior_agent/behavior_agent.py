@@ -1115,8 +1115,8 @@ class BehaviorAgent(BasicAgent):
 
             if ttc > self.PEDESTRIAN_PREDICTION_TIME:
                 continue
-
-            if distance < best_distance:
+            
+            if ttc < best_ttc :
                 best_distance = distance
                 best_ttc = ttc
                 best_walker = walker
@@ -1326,7 +1326,7 @@ class BehaviorAgent(BasicAgent):
 
         if walker_state:
             self._update_pedestrian_wait_tracking(walker)
-            distance = (distance 
+            distance = (w_distance 
                         - max(walker.bounding_box.extent.x, walker.bounding_box.extent.y)
                         - max(self._vehicle.bounding_box.extent.x,self._vehicle.bounding_box.extent.y))
             
