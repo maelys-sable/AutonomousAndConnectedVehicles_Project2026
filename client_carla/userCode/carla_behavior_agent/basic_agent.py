@@ -483,7 +483,7 @@ class BasicAgent(object):
         if self._ignore_vehicles:
             return (False, None, -1)
 
-        if not vehicle_list:
+        if vehicle_list is None:
             vehicle_list = self._world.get_actors().filter("*vehicle*")
 
         if not max_distance:
