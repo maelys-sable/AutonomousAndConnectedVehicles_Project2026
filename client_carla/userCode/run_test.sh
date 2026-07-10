@@ -4,9 +4,6 @@
 export ROUTES=/workspace/team_code/route_1_avddiem.xml
 #export ROUTES=${LEADERBOARD_ROOT}/data/routes_devtest.xml
 
-#export ROUTES=/workspace/team_code/route_test_parked_7.xml
-#export CHECKPOINT_ENDPOINT=/workspace/team_code/results_parked_7.json   # évite d'écraser ta baseline complète
-
 export REPETITIONS=1
 export DEBUG_CHALLENGE=1
 export TEAM_AGENT=/workspace/team_code/carla_behavior_agent/basic_autonomous_agent.py
