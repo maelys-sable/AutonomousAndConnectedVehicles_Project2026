@@ -354,27 +354,32 @@ class BehaviorAgent(BasicAgent):
 
     def stop_sign_manager(self):
         """
-        This method is in charge of behaviors for stop signs.
+        Management of driver behaviour at stop signs, including traffic monitoring.
         """
         affected, stop_sign = self._affected_by_stop_sign()
 
         if not affected:
-            # Left the trigger zone: re-arm for the next (or same) sign.
             self._target_stop_sign = None
             self._stop_sign_done_id = None
             return False
 
-        # Already completed a full stop for this sign while still near it.
         if stop_sign.id == self._stop_sign_done_id:
             return False
 
         self._target_stop_sign = stop_sign.id
+        ego_waypoint = self._map.get_waypoint(self._vehicle.get_location())
 
         if get_speed(self._vehicle) < self.STOP_SIGN_SPEED_EPSILON:
-            self._stop_sign_done_id = stop_sign.id
-            self._target_stop_sign = None
-            self._log_stop_sign_transition('cleared', stop_sign)
-            return False
+            
+            obstacle_state, obstacle_vehicle, obstacle_distance = self._cross_traffic_obstacle(ego_waypoint)
+            
+            if self._junction_gap_is_safe(obstacle_state, obstacle_vehicle, obstacle_distance):
+                self._stop_sign_done_id = stop_sign.id
+                self._target_stop_sign = None
+                self._log_stop_sign_transition('cleared', stop_sign)
+                return False
+            else:
+                return True
 
         self._log_stop_sign_transition('stopping', stop_sign)
         return True
